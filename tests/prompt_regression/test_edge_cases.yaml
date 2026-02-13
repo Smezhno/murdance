@@ -1,0 +1,104 @@
+# Prompt regression test: Edge cases
+# Per CONTRACT §21: YAML test suites with user input → expected (contains/not_contains/tool_calls)
+# Tests: correction, topic change, past date
+
+name: "Edge Cases Tests"
+description: "Correction, topic change, past date rejection"
+
+tests:
+  - name: "correction_datetime_step1"
+    user: "Хочу записаться на бачату завтра в 20:00"
+    expected:
+      contains:
+        - "бачата"
+        - "завтра"
+        - "20:00"
+      not_contains:
+        - "ошибка"
+      tool_calls:
+        - name: "get_schedule"
+
+  - name: "correction_datetime_step2"
+    user: "Нет, в 19:00"
+    expected:
+      contains:
+        - "19:00"
+      not_contains:
+        - "ошибка"
+        - "20:00"
+      tool_calls: []
+
+  - name: "topic_change_mid_booking_step1"
+    user: "Хочу записаться на бачату"
+    expected:
+      contains:
+        - "бачата"
+        - "записаться"
+      not_contains:
+        - "ошибка"
+      tool_calls: []
+
+  - name: "topic_change_mid_booking_step2"
+    user: "А сколько стоит разовое занятие?"
+    expected:
+      contains:
+        - "цена"
+        - "разовое"
+        - "₽"
+      not_contains:
+        - "ошибка"
+      tool_calls: []
+
+  - name: "topic_change_mid_booking_step3"
+    user: "Хорошо, записывай на бачату"
+    expected:
+      contains:
+        - "бачата"
+        - "записаться"
+      not_contains:
+        - "ошибка"
+      tool_calls: []
+
+  - name: "past_date_rejection"
+    user: "Хочу записаться на вчера в 19:00"
+    expected:
+      contains:
+        - "прошло"
+      not_contains:
+        - "ошибка"
+        - "записал"
+      tool_calls: []
+
+  - name: "invalid_time_format"
+    user: "Запиши на бачату в 25:00"
+    expected:
+      contains:
+        - "время"
+      not_contains:
+        - "записал"
+        - "25:00"
+      tool_calls: []
+
+  - name: "empty_message_handling"
+    user: ""
+    expected:
+      contains:
+        - "помочь"
+      not_contains:
+        - "ошибка"
+      tool_calls: []
+
+  - name: "multiple_slots_at_once"
+    user: "Хочу записаться на бачату завтра в 19:00, меня зовут Мария, телефон +79991234567"
+    expected:
+      contains:
+        - "бачата"
+        - "завтра"
+        - "19:00"
+        - "Мария"
+        - "+79991234567"
+      not_contains:
+        - "ошибка"
+      tool_calls:
+        - name: "get_schedule"
+

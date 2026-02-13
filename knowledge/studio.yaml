@@ -1,0 +1,246 @@
+schema_version: "1.0"
+
+studio:
+  name: "Студия танцев Татьяны"
+  address: "ул. Пушкина, д. 10, офис 201, Владивосток"
+  phone: "+7 (423) 123-45-67"
+  schedule: "Пн-Пт: 18:00-22:00, Сб-Вс: 10:00-20:00"
+  timezone: "Asia/Vladivostok"
+
+tone:
+  style: "дружелюбный, поддерживающий"
+  pronouns: "ты"
+  emoji: true
+  language: "ru"
+
+services:
+  - id: "bachata"
+    name: "Бачата"
+    description: "Страстный латиноамериканский танец для пар"
+    price_single: 800.0
+
+  - id: "kizomba"
+    name: "Кизомба"
+    description: "Чувственный африканский танец"
+    price_single: 800.0
+
+  - id: "salsa"
+    name: "Сальса"
+    description: "Энергичный латиноамериканский танец"
+    price_single: 800.0
+
+  - id: "strip-plastic"
+    name: "Стрип-пластика"
+    description: "Пластика и грация для женщин"
+    price_single: 900.0
+
+  - id: "stretching"
+    name: "Стретчинг"
+    description: "Растяжка и гибкость"
+    price_single: 600.0
+
+  - id: "lady-style"
+    name: "Леди-стайл"
+    description: "Женственный танец, развитие женственности"
+    price_single: 900.0
+
+  - id: "contemporary"
+    name: "Contemporary"
+    description: "Современный танец с элементами импровизации"
+    price_single: 800.0
+
+  - id: "hip-hop"
+    name: "Hip-Hop"
+    description: "Уличные танцы в стиле хип-хоп"
+    price_single: 700.0
+
+teachers:
+  - id: "tatyana"
+    name: "Татьяна"
+    styles:
+      - "bachata"
+      - "kizomba"
+      - "salsa"
+      - "strip-plastic"
+      - "lady-style"
+    specialization: "Основатель студии, хореограф с 15-летним опытом. Специализация: латиноамериканские танцы и женская пластика."
+
+  - id: "maria"
+    name: "Мария"
+    styles:
+      - "hip-hop"
+      - "contemporary"
+      - "stretching"
+    specialization: "Профессиональный танцор, участник международных соревнований по хип-хопу."
+
+  - id: "anna"
+    name: "Анна"
+    styles:
+      - "contemporary"
+      - "stretching"
+      - "lady-style"
+    specialization: "Выпускница балетной академии, преподаватель contemporary и растяжки."
+
+schedule:
+  - service_id: "bachata"
+    teacher_id: "tatyana"
+    day: "monday"
+    time: "19:00"
+    duration_minutes: 60
+    max_students: 15
+    level: "начинающие"
+    room: "Зал 1"
+
+  - service_id: "kizomba"
+    teacher_id: "tatyana"
+    day: "monday"
+    time: "20:30"
+    duration_minutes: 60
+    max_students: 12
+    level: "продолжающие"
+    room: "Зал 1"
+
+  - service_id: "salsa"
+    teacher_id: "tatyana"
+    day: "tuesday"
+    time: "19:00"
+    duration_minutes: 60
+    max_students: 15
+    level: "начинающие"
+    room: "Зал 1"
+
+  - service_id: "strip-plastic"
+    teacher_id: "tatyana"
+    day: "tuesday"
+    time: "20:30"
+    duration_minutes: 60
+    max_students: 10
+    level: "начинающие"
+    room: "Зал 2"
+
+  - service_id: "lady-style"
+    teacher_id: "tatyana"
+    day: "wednesday"
+    time: "19:00"
+    duration_minutes: 60
+    max_students: 10
+    level: "начинающие"
+    room: "Зал 2"
+
+  - service_id: "hip-hop"
+    teacher_id: "maria"
+    day: "wednesday"
+    time: "20:30"
+    duration_minutes: 60
+    max_students: 15
+    level: "начинающие"
+    room: "Зал 1"
+
+  - service_id: "contemporary"
+    teacher_id: "maria"
+    day: "thursday"
+    time: "19:00"
+    duration_minutes: 60
+    max_students: 12
+    level: "продолжающие"
+    room: "Зал 1"
+
+  - service_id: "stretching"
+    teacher_id: "anna"
+    day: "thursday"
+    time: "20:30"
+    duration_minutes: 45
+    max_students: 15
+    level: "все уровни"
+    room: "Зал 2"
+
+  - service_id: "contemporary"
+    teacher_id: "anna"
+    day: "friday"
+    time: "19:00"
+    duration_minutes: 60
+    max_students: 12
+    level: "начинающие"
+    room: "Зал 1"
+
+  - service_id: "salsa"
+    teacher_id: "tatyana"
+    day: "saturday"
+    time: "18:00"
+    duration_minutes: 60
+    max_students: 15
+    level: "продолжающие"
+    room: "Зал 1"
+
+  - service_id: "lady-style"
+    teacher_id: "tatyana"
+    day: "saturday"
+    time: "19:30"
+    duration_minutes: 60
+    max_students: 10
+    level: "продолжающие"
+    room: "Зал 2"
+
+subscriptions:
+  - id: "sub_4"
+    name: "Абонемент на 4 занятия"
+    classes: 4
+    price: 2800.0
+    validity_days: 30
+
+  - id: "sub_8"
+    name: "Абонемент на 8 занятий"
+    classes: 8
+    price: 5000.0
+    validity_days: 30
+
+  - id: "sub_unlimited"
+    name: "Безлимит"
+    classes: -1
+    price: 7000.0
+    validity_days: 30
+
+policies:
+  cancellation: "Отмена занятия возможна минимум за 2 часа до начала. Отмена позже влечет списание занятия."
+  trial_class: "Первое занятие для новичков — со скидкой 50%. Запись обязательна."
+  what_to_bring: "Удобную спортивную одежду, сменную обувь (чешки или балетки) и бутылку воды."
+  late_arrival: "Опоздание более чем на 15 минут — занятие не допускается. При опоздании до 15 минут — можно присоединиться."
+
+faq:
+  - q: "Сколько стоит разовое занятие?"
+    a: "Разовое занятие стоит от 600 до 900 рублей в зависимости от направления. Абонементы: 4 занятия — 2800₽, 8 занятий — 5000₽, безлимит — 7000₽."
+
+  - q: "Нужна ли предварительная запись?"
+    a: "Да, запись обязательна. Запишись через бота или позвони по телефону +7 (423) 123-45-67."
+
+  - q: "Что нужно взять с собой на первое занятие?"
+    a: "Удобную спортивную одежду, сменную обувь (чешки или балетки) и бутылку воды."
+
+  - q: "Можно ли прийти без подготовки?"
+    a: "Конечно! У нас есть группы для начинающих. Преподаватели помогут освоиться."
+
+  - q: "Как отменить занятие?"
+    a: "Напиши боту или позвони в студию минимум за 2 часа до занятия. Отмена позже может повлечь списание занятия."
+
+  - q: "Есть ли пробное занятие?"
+    a: "Да, первое занятие для новичков — со скидкой 50%. Запишись через бота!"
+
+  - q: "Какие направления есть в студии?"
+    a: "Бачата, Кизомба, Сальса, Стрип-пластика, Стретчинг, Леди-стайл, Contemporary и Hip-Hop. Выбери то, что тебе ближе!"
+
+  - q: "Работает ли студия в праздники?"
+    a: "Расписание может меняться в праздничные дни. Уточни у бота или позвони в студию."
+
+holidays:
+  - from: "2025-12-30"
+    to: "2026-01-08"
+    name: "Новогодние каникулы"
+    message: "Студия отдыхает с 30 декабря 2025 по 8 января 2026. Запись на занятия возобновится 9 января 2026."
+
+escalation:
+  triggers:
+    - "администратор"
+    - "руководитель"
+    - "жалоба"
+    - "проблема"
+    - "не работает"

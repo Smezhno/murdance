@@ -1,0 +1,135 @@
+# DanceBot — Cursor Rules
+
+## Identity
+You are implementing DanceBot — an AI chatbot backend for a dance studio.
+You write production Python code. You follow the contract strictly.
+
+## Source of Truth
+1. **CONTRACT.md** — hard rules, architecture, constraints. READ FIRST before any task.
+2. **RFC_REFERENCE.md** — detailed specs, CRM API, FSM transitions, corner cases. Use as reference.
+3. CONTRACT overrides RFC on conflicts.
+
+## Core Principles
+- If unclear or missing — **ASK**. Never invent business logic, CRM endpoints, or KB fields.
+- Bot MUST NOT invent schedule, prices, availability, or teacher opinions.
+- Every outbound message goes through Redis queue → worker sends. Never send directly from api.
+- All conversations logged to Postgres with trace_id.
+
+## Before Writing Code
+1. Read the relevant CONTRACT.md section(s)
+2. Propose file structure + plan
+3. List which contract requirements are satisfied
+4. Wait for approval, then implement
+
+## Tech Stack (fixed, do not change)
+- Python 3.11+
+- FastAPI + uvicorn
+- Redis (sessions, locks, cache, queues, budgets)
+- PostgreSQL (logs, audit, metrics, DLQ)
+- httpx (async HTTP for CRM + messenger APIs)
+- structlog (structured logging)
+- pydantic v2 (all data models, strict validation)
+- Docker Compose (app + worker + redis + postgres + caddy)
+
+## Do NOT Use
+- Kafka, RabbitMQ, or any message broker (Redis lists are the queue)
+- SQLAlchemy ORM (use raw asyncpg with pydantic models)
+- Microservice architecture
+- Frontend frameworks
+- Global mutable state
+
+## Code Style
+- Type hints everywhere. No `Any` unless unavoidable.
+- Files under 300 lines. Split into modules proactively.
+- Functions under 50 lines. Extract helpers.
+- Every external call (CRM, LLM, messenger) wrapped in try/except with structured logging.
+- Use `async def` for all I/O operations.
+- Pydantic models for all data boundaries (inbound messages, CRM responses, LLM output).
+- Constants in config.py via pydantic-settings, loaded from .env.
+- No hardcoded secrets, URLs, or credentials anywhere in code.
+
+## Architecture Rules
+- 2 processes: `app` (FastAPI) and `worker` (standalone Python process, same codebase)
+- Communication: app pushes to Redis list → worker consumes
+- CRM (Impulse): HTTP Basic auth, POST to /api/{entity}/{action}. See CONTRACT §5.
+- LLM: only for intent classification, slot extraction, message rewriting. Never for facts.
+- FSM: deterministic state machine with slot filling. See CONTRACT §7.
+- Idempotency: sha256(phone + schedule_id), Redis SETNX before CRM call. See CONTRACT §10.
+- Budget Guard: hard limits on tokens/cost, auto-switch to static KB. See CONTRACT §12.
+
+## Testing
+- Prompt regression tests in YAML format (tests/prompt_regression/)
+- temperature=0, seed=42 for deterministic output
+- Pass threshold: ≥90% of suite. Below 90% → deploy blocked.
+- TEST_MODE=true: mock CRM, full trace stdout, /debug /trace /reset /budget commands
+
+## Logging & Security
+- trace_id (UUID) on every inbound message, passed through all components
+- NEVER log: API keys, CRM auth, passwords, full raw_payload
+- Mask PII in logs: phone → +7999****567
+- Webhook signature verification mandatory (TG: secret_token, WA: X-Hub-Signature-256)
+- User messages in LLM `user` role only, never `system`
+
+## When Modifying Existing Code
+- Explain what changes and why
+- Confirm no existing tests break
+- Run affected prompt regression tests if changing prompts or KB
+
+## Project Structure Reference
+```
+dancebot/
+├── app/
+│   ├── main.py              # FastAPI app, webhook endpoints, /health
+│   ├── config.py            # pydantic-settings, all env vars
+│   ├── models.py            # UnifiedMessage, Session, BookingRequest
+│   ├── channels/
+│   │   ├── base.py          # ChannelProtocol
+│   │   ├── telegram.py      # TG webhook handler
+│   │   ├── whatsapp.py      # WA webhook handler (Phase 2)
+│   │   ├── filters.py       # Non-text message filter
+│   │   └── dedup.py         # Inbound message deduplication
+│   ├── core/
+│   │   ├── fsm.py           # FSM states enum, transition logic
+│   │   ├── conversation.py  # Session management, slot filling
+│   │   ├── intent.py        # Intent classification wrapper
+│   │   ├── temporal.py      # Relative date parser (code, not LLM)
+│   │   ├── idempotency.py   # Booking dedup guard
+│   │   ├── escalation.py    # Human handoff relay
+│   │   └── session_recovery.py
+│   ├── ai/
+│   │   ├── router.py        # LLM provider selection
+│   │   ├── budget_guard.py  # Token/cost limits
+│   │   ├── policy.py        # Hard rules enforcer
+│   │   ├── json_parser.py   # 3-step LLM JSON extraction
+│   │   └── providers/
+│   │       ├── base.py      # LLMProvider protocol
+│   │       └── yandexgpt.py # YandexGPT Pro 5.1
+│   ├── integrations/
+│   │   └── impulse/
+│   │       ├── client.py    # httpx + Basic auth
+│   │       ├── models.py    # CRM response models
+│   │       ├── cache.py     # Redis cache with TTL
+│   │       ├── fallback.py  # Fallback queue on CRM error
+│   │       └── error_handler.py
+│   └── storage/
+│       ├── redis.py         # Redis connection pool
+│       └── postgres.py      # asyncpg, table creation, queries
+├── worker/
+│   ├── main.py              # Worker entrypoint
+│   ├── outbound.py          # Queue consumer, rate limiter
+│   ├── reminders.py         # Reminder scheduler
+│   └── dlq.py               # Dead letter queue handler
+├── knowledge/
+│   ├── base.py              # KB loader + validator
+│   └── studio.yaml          # Studio data (schema v1.0)
+├── tests/
+│   ├── prompt_regression/
+│   ├── e2e/
+│   └── unit/
+├── docker-compose.yml
+├── Dockerfile
+├── .env.example
+├── CONTRACT.md              # Source of truth
+├── RFC_REFERENCE.md          # Detailed reference
+└── pyproject.toml
+```

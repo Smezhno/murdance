@@ -1,0 +1,66 @@
+# Prompt regression test: Schedule queries
+# Per CONTRACT §21: YAML test suites with user input → expected (contains/not_contains/tool_calls)
+
+name: "Schedule Query Tests"
+description: "Various schedule query scenarios"
+
+tests:
+  - name: "query_schedule_today"
+    user: "Какие занятия сегодня?"
+    expected:
+      contains:
+        - "расписание"
+        - "занятия"
+      not_contains:
+        - "ошибка"
+        - "не понял"
+      tool_calls:
+        - name: "get_schedule"
+
+  - name: "query_schedule_by_style"
+    user: "Когда бачата?"
+    expected:
+      contains:
+        - "бачата"
+        - "расписание"
+        - "занятие"
+      not_contains:
+        - "ошибка"
+      tool_calls:
+        - name: "get_schedule"
+
+  - name: "query_schedule_tomorrow"
+    user: "Что будет завтра?"
+    expected:
+      contains:
+        - "завтра"
+        - "расписание"
+        - "занятия"
+      not_contains:
+        - "ошибка"
+      tool_calls:
+        - name: "get_schedule"
+
+  - name: "query_schedule_week"
+    user: "Покажи расписание на неделю"
+    expected:
+      contains:
+        - "расписание"
+        - "неделя"
+      not_contains:
+        - "ошибка"
+      tool_calls:
+        - name: "get_schedule"
+
+  - name: "query_schedule_specific_day"
+    user: "Какие занятия в среду?"
+    expected:
+      contains:
+        - "среда"
+        - "расписание"
+        - "занятия"
+      not_contains:
+        - "ошибка"
+      tool_calls:
+        - name: "get_schedule"
+

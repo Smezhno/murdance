@@ -1,0 +1,78 @@
+# Prompt regression test: Booking flow happy path
+# Per CONTRACT §21: YAML test suites with user input → expected (contains/not_contains/tool_calls)
+# Stability: temperature=0, 3 runs, pass if 2/3
+
+name: "Booking Flow Happy Path"
+description: "Complete booking flow from greeting to confirmation (6 steps)"
+
+tests:
+  - name: "step_1_greeting"
+    user: "Привет, хочу записаться на занятие"
+    expected:
+      contains:
+        - "помогу"
+        - "записаться"
+        - "занятие"
+      not_contains:
+        - "ошибка"
+        - "не понял"
+      tool_calls: []
+
+  - name: "step_2_group_selection"
+    user: "Бахata"
+    expected:
+      contains:
+        - "направление"
+        - "бачата"
+      not_contains:
+        - "ошибка"
+      tool_calls: []
+
+  - name: "step_3_datetime"
+    user: "Завтра в 19:00"
+    expected:
+      contains:
+        - "дата"
+        - "время"
+        - "19"
+      not_contains:
+        - "ошибка"
+        - "не понял"
+      tool_calls:
+        - name: "get_schedule"
+
+  - name: "step_4_contact_info"
+    user: "Меня зовут Иван, телефон +79991234567"
+    expected:
+      contains:
+        - "имя"
+        - "телефон"
+        - "Иван"
+      not_contains:
+        - "ошибка"
+      tool_calls: []
+
+  - name: "step_5_confirmation_prompt"
+    user: "Да, всё верно"
+    expected:
+      contains:
+        - "подтвердите"
+        - "запись"
+      not_contains:
+        - "ошибка"
+      tool_calls: []
+
+  - name: "step_6_confirm_yes"
+    user: "Да, подтверждаю"
+    expected:
+      contains:
+        - "запись"
+        - "подтверждена"
+        - "✅"
+      not_contains:
+        - "ошибка"
+        - "не удалось"
+      # Note: tool_calls are for documentation only, validation not implemented yet
+      tool_calls:
+        - name: "create_booking"
+
