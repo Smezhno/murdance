@@ -148,12 +148,12 @@ async def transition_state(
     return True
 
 
-async def update_slots(session: Session, **slot_updates: str | datetime | None) -> None:
+async def update_slots(session: Session, **slot_updates: str | datetime | list | None) -> None:
     """Update slot values in session.
 
     Args:
         session: Session to update
-        **slot_updates: Slot field updates (group, datetime_raw, datetime_resolved, etc.)
+        **slot_updates: Slot field updates (group, datetime_raw, datetime_resolved, messages, etc.)
     """
     for key, value in slot_updates.items():
         if hasattr(session.slots, key):

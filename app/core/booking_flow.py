@@ -54,25 +54,40 @@ class BookingFlow:
             message.chat_id,
         )
 
+        # Build conversation history from session slots (last 10 messages)
+        conversation_history = session.slots.messages[-10:] if session.slots.messages else None
+
         # Handle special commands
         if message.text.startswith("/debug"):
             return await self._handle_debug_command(session)
 
         # Process based on current state
         if session.state == ConversationState.IDLE:
-            return await self._handle_idle(message, session, trace_id)
+            response_text = await self._handle_idle(message, session, trace_id, conversation_history)
         elif session.state == ConversationState.BOOKING_IN_PROGRESS:
-            return await self._handle_booking_in_progress(message, session)
+            response_text = await self._handle_booking_in_progress(message, session)
         elif session.state == ConversationState.ADMIN_RESPONDING:
-            return await self._handle_admin_responding(message, session)
+            response_text = await self._handle_admin_responding(message, session)
         else:
-            return await self._handle_collecting_slots(message, session, trace_id)
+            response_text = await self._handle_collecting_slots(message, session, trace_id, conversation_history)
+
+        # Update conversation history: append user message and bot response (keep last 10)
+        if message.text and response_text:
+            session.slots.messages.append({"role": "user", "content": message.text})
+            session.slots.messages.append({"role": "assistant", "content": response_text})
+            # Keep last 10 messages
+            session.slots.messages = session.slots.messages[-10:]
+            # Save updated slots
+            await update_slots(session, messages=session.slots.messages)
+
+        return response_text
 
     async def _handle_idle(
         self,
         message: UnifiedMessage,
         session: Any,
         trace_id: UUID,
+        conversation_history: list[dict[str, str]] | None = None,
     ) -> str:
         """Handle message in IDLE state."""
         from app.core.intent import resolve_intent
@@ -83,6 +98,7 @@ class BookingFlow:
             session.state.value,
             session.slots.model_dump(),
             trace_id,
+            conversation_history=conversation_history,
         )
 
         intent = intent_result.get("intent", "info")
@@ -112,6 +128,7 @@ class BookingFlow:
         message: UnifiedMessage,
         session: Any,
         trace_id: UUID,
+        conversation_history: list[dict[str, str]] | None = None,
     ) -> str:
         """Handle slot collection states."""
         from app.core.intent import resolve_intent
@@ -122,6 +139,7 @@ class BookingFlow:
             session.state.value,
             session.slots.model_dump(),
             trace_id,
+            conversation_history=conversation_history,
         )
 
         slots = intent_result.get("slots", {})
@@ -427,7 +445,20 @@ Updated: {session.updated_at}"""
                     logger.warning(f"Failed to transition to BOOKING_DONE for trace_id={trace_id}")
 
                 # Generate receipt (CONTRACT §6)
-                receipt = await self._generate_booking_receipt(reservation, client)
+                receipt = await self._generate_booking_receipt(reservation, client, session)
+
+                # Log successful booking attempt (CONTRACT §17)
+                await postgres_storage.log_booking_attempt(
+                    trace_id=trace_id,
+                    channel=session.channel,
+                    chat_id=session.chat_id,
+                    success=True,
+                    group_id=session.slots.group,
+                    schedule_id=str(schedule_id),
+                    datetime=session.slots.datetime_resolved,
+                    client_name=session.slots.client_name,
+                    client_phone=session.slots.client_phone,
+                )
 
                 # Auto-transition to IDLE after 5s (handled by FSM timeout)
                 return receipt
@@ -439,6 +470,18 @@ Updated: {session.updated_at}"""
                 success = await transition_state(session, ConversationState.IDLE)
                 if not success:
                     logger.warning(f"Failed to transition to IDLE after error for trace_id={trace_id}")
+                # Log failed booking attempt (CONTRACT §17)
+                await postgres_storage.log_booking_attempt(
+                    trace_id=trace_id,
+                    channel=session.channel,
+                    chat_id=session.chat_id,
+                    success=False,
+                    group_id=session.slots.group,
+                    schedule_id=str(schedule_id) if schedule_id else None,
+                    client_name=session.slots.client_name,
+                    client_phone=session.slots.client_phone,
+                    error_message=str(e),
+                )
                 return str(e)
             except Exception as e:
                 # Other exceptions - generic fallback
@@ -447,6 +490,18 @@ Updated: {session.updated_at}"""
                 success = await transition_state(session, ConversationState.IDLE)
                 if not success:
                     logger.warning(f"Failed to transition to IDLE after error for trace_id={trace_id}")
+                # Log failed booking attempt (CONTRACT §17)
+                await postgres_storage.log_booking_attempt(
+                    trace_id=trace_id,
+                    channel=session.channel,
+                    chat_id=session.chat_id,
+                    success=False,
+                    group_id=session.slots.group,
+                    schedule_id=str(schedule_id) if schedule_id else None,
+                    client_name=session.slots.client_name,
+                    client_phone=session.slots.client_phone,
+                    error_message=str(e),
+                )
                 return "Произошла ошибка при создании записи. Записал заявку — администратор подтвердит."
 
         except RuntimeError as e:
@@ -454,31 +509,97 @@ Updated: {session.updated_at}"""
             success = await transition_state(session, ConversationState.IDLE)
             if not success:
                 logger.warning(f"Failed to transition to IDLE after error for trace_id={trace_id}")
+            # Log failed booking attempt (CONTRACT §17)
+            await postgres_storage.log_booking_attempt(
+                trace_id=trace_id,
+                channel=session.channel,
+                chat_id=session.chat_id,
+                success=False,
+                group_id=session.slots.group,
+                schedule_id=None,  # schedule_id not found yet
+                client_name=session.slots.client_name,
+                client_phone=session.slots.client_phone,
+                error_message=str(e),
+            )
             return str(e)
         except Exception as e:
             # Other exceptions - generic fallback
             success = await transition_state(session, ConversationState.IDLE)
             if not success:
                 logger.warning(f"Failed to transition to IDLE after error for trace_id={trace_id}")
+            # Log failed booking attempt (CONTRACT §17)
+            await postgres_storage.log_booking_attempt(
+                trace_id=trace_id,
+                channel=session.channel,
+                chat_id=session.chat_id,
+                success=False,
+                group_id=session.slots.group,
+                schedule_id=None,  # schedule_id not found yet
+                client_name=session.slots.client_name,
+                client_phone=session.slots.client_phone,
+                error_message=str(e),
+            )
             return "Произошла ошибка при создании записи. Записал заявку — администратор подтвердит."
 
     async def _generate_booking_receipt(
         self,
         reservation: Reservation,
         client: Client,
+        session: Any,
     ) -> str:
-        """Generate booking receipt (CONTRACT §6)."""
-        # Get schedule details
-        # For now, simplified receipt
-        return f"""✅ Запись подтверждена!
+        """Generate booking receipt (CONTRACT §6).
 
-Ваши данные:
-Имя: {client.name}
-Телефон: {client.phone}
+        Per CONTRACT §6: receipt must include date/time/group/address.
+        Response length: TG ≤ 300 chars.
+        """
+        # Get slots from session
+        slots = session.slots
+        group = slots.group or "не указано"
+        
+        # Format datetime
+        datetime_str = "не указано"
+        if slots.datetime_resolved:
+            datetime_str = slots.datetime_resolved.strftime("%d.%m.%Y %H:%M")
+        elif slots.datetime_raw:
+            datetime_str = slots.datetime_raw
+        
+        # Get studio address from KB
+        studio_address = self.kb.studio.address
+        
+        # Format receipt (keep under 300 chars per CONTRACT §6)
+        receipt_template = """✅ Запись подтверждена!
 
-Номер записи: {reservation.id}
+Направление: {group}
+Дата и время: {datetime_str}
+Имя: {name}
+Телефон: {phone}
+Адрес: {address}
 
-Если возникнут вопросы, напишите нам!"""
+Номер записи: {reservation_id}
+Напомню за день до занятия!"""
+        
+        receipt = receipt_template.format(
+            group=group,
+            datetime_str=datetime_str,
+            name=client.name,
+            phone=client.phone,
+            address=studio_address,
+            reservation_id=reservation.id,
+        )
+        
+        # Ensure receipt is under 300 chars (CONTRACT §6)
+        if len(receipt) > 300:
+            # Truncate address if needed
+            base_length = len(receipt) - len(studio_address)
+            max_address_len = 300 - base_length - 3  # -3 for "..."
+            if max_address_len > 0:
+                truncated_address = studio_address[:max_address_len] + "..."
+                receipt = receipt.replace(studio_address, truncated_address)
+            else:
+                # If even without address it's too long, truncate the whole receipt
+                receipt = receipt[:297] + "..."
+        
+        return receipt
 
 
 @lru_cache()

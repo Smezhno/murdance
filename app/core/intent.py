@@ -90,7 +90,7 @@ async def resolve_intent(
     result: dict[str, Any] = {
         "intent": "info",  # Default
         "slots": {},
-        "response_text": response.text,
+        "response_text": response.text,  # Will be overridden if JSON parsed successfully
     }
 
     # Try to extract structured data from response
@@ -98,6 +98,8 @@ async def resolve_intent(
     if json_data:
         result["intent"] = json_data.get("intent", "info")
         result["slots"] = json_data.get("slots", {})
+        # Use "response" field from JSON if available, otherwise fallback to raw text
+        result["response_text"] = json_data.get("response", response.text)
 
     return result
 

@@ -138,7 +138,7 @@ async def telegram_webhook(request: Request) -> Response:
 async def health_check() -> JSONResponse:
     """Health check endpoint (CONTRACT §22).
 
-    Returns: {status, redis, crm}
+    Returns: {status, redis, postgres, crm}
     """
     settings = get_settings()
 
@@ -156,8 +156,18 @@ async def health_check() -> JSONResponse:
     except Exception:
         pass
 
+    # Check CRM
+    crm_healthy = False
+    try:
+        from app.integrations.impulse import get_impulse_adapter
+
+        impulse = get_impulse_adapter()
+        crm_healthy = await impulse.health_check()
+    except Exception:
+        pass
+
     # Overall status
-    overall_status = "healthy" if (redis_healthy and postgres_healthy) else "degraded"
+    overall_status = "healthy" if (redis_healthy and postgres_healthy and crm_healthy) else "degraded"
 
     return JSONResponse(
         status_code=status.HTTP_200_OK if overall_status == "healthy" else status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -165,8 +175,7 @@ async def health_check() -> JSONResponse:
             "status": overall_status,
             "redis": "healthy" if redis_healthy else "unhealthy",
             "postgres": "healthy" if postgres_healthy else "unhealthy",
-            # CRM check will be added in Phase 2
-            "crm": "not_implemented",
+            "crm": "healthy" if crm_healthy else "unhealthy",
         },
     )
 

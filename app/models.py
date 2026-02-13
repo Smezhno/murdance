@@ -91,6 +91,10 @@ class SlotValues(BaseModel):
     client_name: str | None = None
     client_phone: str | None = None
     schedule_id: str | None = None
+    messages: list[dict[str, str]] = Field(
+        default_factory=list,
+        description="Conversation history (last 10 messages for LLM context)",
+    )
 
 
 class Session(BaseModel):

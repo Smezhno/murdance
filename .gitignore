@@ -41,6 +41,8 @@ ENV/
 .env
 .env.local
 .env.*.local
+# But allow .env.example to be committed (it's a template)
+!.env.example
 
 # Logs
 *.log
