@@ -17,7 +17,7 @@ from app.core.cancel_flow import get_cancel_flow
 from app.core.conversation import get_or_create_session, transition_state, update_slots
 from app.core.response_generator import generate_response
 from app.core.schedule_flow import generate_schedule_response, is_schedule_query
-from app.core.slot_collector import all_slots_filled, collect_slots
+from app.core.slot_collector import _ask_next_slot, all_slots_filled, collect_slots, get_missing_slots
 from app.integrations.impulse import get_impulse_adapter
 from app.core.temporal import get_temporal_parser
 from app.knowledge.base import get_kb
@@ -200,8 +200,10 @@ class BookingFlow:
                 await update_slots(session, **non_null)
 
             # If direction already known — show its schedule right away (no second LLM call)
+            # But only if teacher is not yet known — otherwise go straight to collect_slots
             group = slots.get("group") or session.slots.group
-            if group and not session.slots.datetime_resolved:
+            teacher = slots.get("teacher") or session.slots.teacher
+            if group and not session.slots.datetime_resolved and not teacher:
                 sched = await generate_schedule_response(
                     self.impulse, {"group": group}, trace_id, message.text
                 )
@@ -210,6 +212,28 @@ class BookingFlow:
             if all_slots_filled(session):
                 await transition_state(session, ConversationState.CONFIRM_BOOKING)
                 return generate_confirmation_summary(session)
+
+            # Group known — ask for the next missing slot (datetime / contact)
+            if session.slots.group:
+                missing = get_missing_slots(session)
+                return await _ask_next_slot(missing, session, trace_id, history)
+
+            # Teacher known but group unknown — look up group from CRM schedule
+            if session.slots.teacher and not session.slots.group:
+                try:
+                    schedules = await self.impulse.get_schedule()
+                    teacher_lower = session.slots.teacher.lower()
+                    for s in schedules:
+                        t_name = getattr(s, "teacher_name", None) or ""
+                        if teacher_lower in t_name.lower():
+                            group_name = getattr(s, "style_name", None)
+                            if group_name:
+                                await update_slots(session, group=group_name)
+                                missing = get_missing_slots(session)
+                                return await _ask_next_slot(missing, session, trace_id, history)
+                            break
+                except Exception:
+                    pass
 
             return await generate_response("ask_direction", {}, trace_id, history)
 
