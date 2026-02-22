@@ -21,7 +21,7 @@ class YandexGPTProvider:
         self.settings = get_settings()
         self.api_key = self.settings.yandexgpt_api_key
         self.folder_id = self.settings.yandexgpt_folder_id
-        self.model = "yandexgpt-pro/latest"  # YandexGPT Pro 5.1
+        self.model = "yandexgpt-32k/latest"
         self.base_url = "https://llm.api.cloud.yandex.net/foundationModels/v1/completion"
         # Persistent httpx client
         self._client: httpx.AsyncClient | None = None
@@ -107,7 +107,7 @@ class YandexGPTProvider:
 
         # Extract token usage
         usage = result.get("usage", {})
-        tokens_used = usage.get("totalTokens", 0)
+        tokens_used = int(usage.get("totalTokens", 0))
 
         # Calculate cost: YandexGPT Pro costs 0.41 RUB per 1000 tokens
         cost_per_1k_tokens_rub = 0.41

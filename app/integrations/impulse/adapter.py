@@ -40,34 +40,37 @@ class ImpulseAdapter:
             group_id: Group ID filter
 
         Returns:
-            List of schedule entries
+            List of schedule entries, filtered by CRM_BRANCH_ID if configured
         """
+        from app.config import get_settings
+        settings = get_settings()
+        branch_id = settings.crm_branch_id
+
         try:
             # Check cache
-            cache_key = f"{date_from}_{date_to}_{group_id}"
+            cache_key = f"{date_from}_{date_to}_{group_id}_{branch_id}"
             cached = await self.cache.get("schedule", cache_key)
             if cached is not None:
                 return [Schedule(**item) for item in cached]
 
-            # Build filters
-            filters: dict[str, Any] = {}
-            if date_from:
-                filters["date"] = date_from.isoformat()
-            if group_id:
-                filters["group_id"] = group_id
-
-            # Fetch from CRM
+            # Fetch from CRM — no field filter, get full objects
             data = await self.client.list(
                 "schedule",
-                fields=["id", "group_id", "teacher_id", "hall_id", "date", "time", "duration_minutes", "max_students", "current_students", "is_active"],
-                filters=filters if filters else None,
+                filters=None,
                 limit=1000,
             )
 
-            # Parse and cache
+            # Parse schedules
             schedules = [Schedule(**item) for item in data]
-            await self.cache.set("schedule", [item.model_dump() for item in schedules], cache_key)
 
+            # Filter by branch in memory (CRM API doesn't support branch filter)
+            if branch_id is not None:
+                schedules = [
+                    s for s in schedules
+                    if s.branch is not None and s.branch.get("id") == branch_id
+                ]
+
+            await self.cache.set("schedule", [item.model_dump() for item in schedules], cache_key)
             return schedules
 
         except Exception as e:
@@ -115,17 +118,24 @@ class ImpulseAdapter:
         """Find client by phone (CONTRACT §5).
 
         Args:
-            phone: Phone number
+            phone: Phone number (any format: 89xx, +79xx, 79xx)
 
         Returns:
             Client if found, None otherwise
         """
         try:
-            # Search by phone
+            # Normalize to +7 format for Impulse CRM
+            normalized = phone.strip().replace(" ", "").replace("-", "")
+            if normalized.startswith("8") and len(normalized) == 11:
+                normalized = "+7" + normalized[1:]
+            elif normalized.startswith("7") and len(normalized) == 11:
+                normalized = "+" + normalized
+            elif not normalized.startswith("+"):
+                normalized = "+" + normalized
+
             data = await self.client.list(
                 "client",
-                fields=["id", "name", "phone", "email", "informer_id"],
-                filters={"phone": phone},
+                filters={"phone": normalized},
                 limit=1,
             )
 
@@ -143,6 +153,9 @@ class ImpulseAdapter:
     async def create_client(self, name: str, phone: str, informer_id: int | None = None, trace_id: UUID | None = None) -> Client:
         """Create new client (CONTRACT §5).
 
+        Impulse CRM /client/list ignores all filters — client lookup by phone is done
+        by attempting to create and parsing the duplicate-error response (500 + HTML with client id).
+
         Args:
             name: Client name
             phone: Phone number
@@ -150,18 +163,60 @@ class ImpulseAdapter:
             trace_id: Optional trace ID
 
         Returns:
-            Created client
+            Created or found client
         """
+        import re as _re
+
+        # Normalize phone to +7 format
+        normalized_phone = phone.strip().replace(" ", "").replace("-", "")
+        if normalized_phone.startswith("8") and len(normalized_phone) == 11:
+            normalized_phone = "+7" + normalized_phone[1:]
+        elif normalized_phone.startswith("7") and len(normalized_phone) == 11:
+            normalized_phone = "+" + normalized_phone
+        elif not normalized_phone.startswith("+"):
+            normalized_phone = "+" + normalized_phone
+
         try:
-            data = {
+            # Impulse CRM requires phone as array, deposit/bonus as non-null integers,
+            # and status with pipeline to avoid getPipeline() null error on reservation creation.
+            data: dict[str, Any] = {
                 "name": name,
-                "phone": phone,
+                "phone": [normalized_phone],
+                "deposit": 0,
+                "bonus": 0,
+                "status": {"id": 1},  # "неразобранное" — default pipeline entry point
             }
             if informer_id:
-                data["informer_id"] = informer_id
+                data["informer"] = {"id": informer_id}
 
-            result = await self.client.create("client", data)
-            return Client(**result)
+            # Use tolerant method — CRM returns 500 HTML when client already exists
+            response = await self.client.create_tolerant("client", data)
+
+            if response.status_code == 200:
+                result = response.json()
+                client_id = result.get("id") if isinstance(result, dict) else None
+                if client_id:
+                    return Client(id=client_id, name=name, phone=[normalized_phone])
+                return Client(**result)
+
+            # 500 with "already exists" message — parse client id from HTML
+            if response.status_code >= 400:
+                error_text = response.text
+                match = _re.search(r"client/edit/(\d+)", error_text)
+                if match:
+                    existing_id = int(match.group(1))
+                    # Ensure existing client has a status/pipeline set (needed for reservation creation)
+                    await self.client.create_tolerant("client", {
+                        "id": existing_id,
+                        "status": {"id": 1},
+                        "deposit": 0,
+                        "bonus": 0,
+                    })
+                    return Client(id=existing_id, name=name, phone=[normalized_phone])
+                # Unexpected error — raise for fallback handling
+                response.raise_for_status()
+
+            return Client(id=0, name=name, phone=[normalized_phone])
 
         except Exception as e:
             user_msg, should_fallback = self.error_handler.handle_error(e)
@@ -179,15 +234,20 @@ class ImpulseAdapter:
         self,
         client_id: int,
         schedule_id: int,
+        booking_date: "datetime | None" = None,
         status_id: int | None = None,
         notes: str | None = None,
         trace_id: UUID | None = None,
     ) -> Reservation:
         """Create booking/reservation (CONTRACT §5).
 
+        Impulse CRM requires a 'time' array with the full raw schedule object,
+        otherwise /reservation/update returns a server-side null-load error.
+
         Args:
             client_id: Client ID
             schedule_id: Schedule ID
+            booking_date: Datetime of the specific class occurrence
             status_id: Optional status ID
             notes: Optional notes
             trace_id: Optional trace ID
@@ -196,20 +256,57 @@ class ImpulseAdapter:
             Created reservation
         """
         try:
-            data = {
-                "client_id": client_id,
-                "schedule_id": schedule_id,
+            from datetime import timezone as tz
+
+            # Midnight UTC timestamp for the booking date
+            ts: int | None = None
+            if booking_date:
+                midnight = booking_date.replace(hour=0, minute=0, second=0, microsecond=0)
+                ts = int(midnight.astimezone(tz.utc).timestamp())
+
+            # Fetch raw schedule object — CRM needs full nested dict in 'time' array
+            raw_schedules = await self.client.list("schedule", filters=None, limit=1000)
+            raw_schedule = next((s for s in raw_schedules if s.get("id") == schedule_id), None)
+
+            data: dict[str, Any] = {
+                "client": {"id": client_id},
+                "schedule": {"id": schedule_id},
+                "type": 0,
             }
-            if status_id:
-                data["status_id"] = status_id
+            if ts is not None:
+                data["date"] = ts
+
+            # Build 'time' array required by Impulse CRM (discovered via API testing)
+            if raw_schedule is not None:
+                time_entry: dict[str, Any] = {
+                    "minutes": raw_schedule.get("minutesBegin"),
+                    "schedule": raw_schedule,
+                    "group": raw_schedule.get("group"),
+                    "type": 0,
+                    "source": 0,
+                }
+                if ts is not None:
+                    time_entry["date"] = ts
+                data["time"] = [time_entry]
+
             if notes:
-                data["notes"] = notes
+                data["annotation"] = notes
 
             result = await self.client.create("reservation", data)
 
             # Invalidate all schedule cache keys
             await self.cache.clear_entity("schedule")
 
+            # CRM returns {"success": true, "count": 1} — no reservation ID in response.
+            # Construct a minimal Reservation from known data.
+            reservation_id = result.get("id") if isinstance(result, dict) else None
+            if not reservation_id:
+                return Reservation(
+                    id=0,
+                    client={"id": client_id},
+                    schedule={"id": schedule_id},
+                    date=booking_date.date().isoformat() if booking_date else None,
+                )
             return Reservation(**result)
 
         except Exception as e:

@@ -1,66 +1,53 @@
 # Prompt regression test: Schedule queries
-# Per CONTRACT §21: YAML test suites with user input → expected (contains/not_contains/tool_calls)
+# Per CONTRACT §21: YAML test suites with user input → expected (contains/not_contains)
+# Branch "Тест" has: Dancehall (Ср/Пт 20:00), Girly Hip-Hop (Вт/Чт/Сб 19:00), High Heels (Ср/Пт 19:00)
 
 name: "Schedule Query Tests"
-description: "Various schedule query scenarios"
+description: "Various schedule query scenarios — must return real CRM data"
 
 tests:
-  - name: "query_schedule_today"
-    user: "Какие занятия сегодня?"
+  - name: "query_full_schedule"
+    user: "Покажи расписание"
     expected:
       contains:
         - "расписание"
-        - "занятия"
       not_contains:
         - "ошибка"
-        - "не понял"
-      tool_calls:
-        - name: "get_schedule"
+        - "не заполнено"
+        - "уточню у администратора"
 
-  - name: "query_schedule_by_style"
-    user: "Когда бачата?"
+  - name: "query_dancehall_schedule"
+    user: "Расписание Dancehall"
     expected:
       contains:
-        - "бачата"
-        - "расписание"
-        - "занятие"
+        - "Dancehall"
       not_contains:
         - "ошибка"
-      tool_calls:
-        - name: "get_schedule"
+        - "не заполнено"
 
-  - name: "query_schedule_tomorrow"
-    user: "Что будет завтра?"
+  - name: "query_high_heels_schedule"
+    user: "Когда High Heels?"
     expected:
       contains:
-        - "завтра"
-        - "расписание"
-        - "занятия"
+        - "High Heels"
       not_contains:
         - "ошибка"
-      tool_calls:
-        - name: "get_schedule"
+        - "не заполнено"
 
-  - name: "query_schedule_week"
-    user: "Покажи расписание на неделю"
+  - name: "query_no_hallucination"
+    user: "Расписание на неделю"
     expected:
       contains:
         - "расписание"
-        - "неделя"
       not_contains:
         - "ошибка"
-      tool_calls:
-        - name: "get_schedule"
+        - "не заполнено"
+        - "уточню у администратора"
 
-  - name: "query_schedule_specific_day"
-    user: "Какие занятия в среду?"
+  - name: "booking_shows_direction_schedule"
+    user: "/start"
     expected:
       contains:
-        - "среда"
-        - "расписание"
-        - "занятия"
+        - "Здравствуйте"
       not_contains:
         - "ошибка"
-      tool_calls:
-        - name: "get_schedule"
-

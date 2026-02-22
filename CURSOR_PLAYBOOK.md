@@ -228,3 +228,7 @@ Remove {X} and use {Y} instead.
 Re-read CONTRACT.md §{N}. Your implementation violates: "{конкретное правило}".
 Fix it.
 ```
+
+
+1. HTTP Basic Auth неправильный
+Impulse CRM использует Authorization: Basic {base64(api_key)}. Cursor делает base64(api_key + ":") — добавляет двоеточие. Формат Basic Auth: base64(username:password). По RFC Appendix A, auth = только API key. Нужно уточнить формат у Impulse — но скорее всего это base64(api_key:) (пустой пароль) или base64(:api_key) (пустой user). Пока оставь как есть, но пометь OQ-8: уточнить формат Basic Auth у Impulse.

@@ -16,7 +16,7 @@ from pydantic import BaseModel, Field
 class TemporalResult(BaseModel):
     """Temporal parsing result."""
 
-    date: date | None = Field(None, description="Resolved date")
+    resolved_date: date | None = Field(None, description="Resolved date")
     time: str | None = Field(None, description="Resolved time (HH:MM format)")
     confidence: Literal["high", "medium", "low"] = Field("low", description="Confidence level")
     ambiguous: bool = Field(False, description="Whether result is ambiguous")
@@ -61,7 +61,7 @@ class TemporalParser:
 
         # Try to parse date patterns
         result = self._parse_date(text_lower, now)
-        if result.date is not None:
+        if result.resolved_date is not None:
             # Try to extract time
             time_str, time_confidence = self._parse_time(text_lower)
             result.time = time_str
@@ -72,7 +72,7 @@ class TemporalParser:
         # Try to parse time-only (today)
         time_str, time_confidence = self._parse_time(text_lower)
         if time_str:
-            result.date = now.date()
+            result.resolved_date = now.date()
             result.time = time_str
             result.confidence = time_confidence if time_confidence != "low" else "medium"
             return result
@@ -92,7 +92,7 @@ class TemporalParser:
         # "сегодня" → today
         if re.search(r"\bсегодня\b", text):
             return TemporalResult(
-                date=now.date(),
+                resolved_date=now.date(),
                 confidence="high",
                 raw_input=text,
             )
@@ -101,7 +101,7 @@ class TemporalParser:
         if re.search(r"\bзавтра\b", text):
             tomorrow = now.date() + timedelta(days=1)
             return TemporalResult(
-                date=tomorrow,
+                resolved_date=tomorrow,
                 confidence="high",
                 raw_input=text,
             )
@@ -110,7 +110,7 @@ class TemporalParser:
         if re.search(r"\bпослезавтра\b", text):
             day_after = now.date() + timedelta(days=2)
             return TemporalResult(
-                date=day_after,
+                resolved_date=day_after,
                 confidence="high",
                 raw_input=text,
             )
@@ -135,13 +135,24 @@ class TemporalParser:
                     days_ahead += 7  # Next week
                 target_date = now.date() + timedelta(days=days_ahead)
                 return TemporalResult(
-                    date=target_date,
+                    resolved_date=target_date,
                     confidence="high",
                     raw_input=text,
                 )
 
-        # Day-of-week WITHOUT preposition: "понедельник 19:00"
-        day_match_no_prep = re.search(r"\b(понедельник|вторник|среду?|четверг|пятницу?|субботу?|воскресенье)\b", text)
+        # Day-of-week abbreviations: "Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"
+        abbrev_match = re.search(r"\b(пн|вт|ср|чт|пт|сб|вс)\b", text)
+        if abbrev_match:
+            abbrev_map = {"пн": 0, "вт": 1, "ср": 2, "чт": 3, "пт": 4, "сб": 5, "вс": 6}
+            target_weekday = abbrev_map[abbrev_match.group(1)]
+            days_ahead = target_weekday - now.weekday()
+            if days_ahead <= 0:
+                days_ahead += 7
+            target_date = now.date() + timedelta(days=days_ahead)
+            return TemporalResult(resolved_date=target_date, confidence="high", raw_input=text)
+
+        # Day-of-week WITHOUT preposition: "понедельник 19:00", "среда", "пятница"
+        day_match_no_prep = re.search(r"\b(понедельник|вторник|среда|среду|четверг|пятница|пятницу|суббота|субботу|воскресенье)\b", text)
         if day_match_no_prep:
             day_name = day_match_no_prep.group(1)
             day_map_no_prep = {
@@ -163,7 +174,7 @@ class TemporalParser:
                     days_ahead += 7  # Next week
                 target_date = now.date() + timedelta(days=days_ahead)
                 return TemporalResult(
-                    date=target_date,
+                    resolved_date=target_date,
                     confidence="high",
                     raw_input=text,
                 )
@@ -183,7 +194,7 @@ class TemporalParser:
                         else:
                             target_date = date(now.year, now.month + 1, day_num)
                     return TemporalResult(
-                        date=target_date,
+                        resolved_date=target_date,
                         confidence="high",
                         raw_input=text,
                     )
@@ -219,7 +230,7 @@ class TemporalParser:
                         )
 
                     return TemporalResult(
-                        date=target_date,
+                        resolved_date=target_date,
                         confidence="high",
                         raw_input=text,
                     )

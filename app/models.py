@@ -86,11 +86,13 @@ class SlotValues(BaseModel):
     """Slot values for booking flow (CONTRACT §7)."""
 
     group: str | None = None
+    teacher: str | None = None
     datetime_raw: str | None = None
     datetime_resolved: datetime | None = None
     client_name: str | None = None
     client_phone: str | None = None
     schedule_id: str | None = None
+    selected_reservation_id: int | None = None
     messages: list[dict[str, str]] = Field(
         default_factory=list,
         description="Conversation history (last 10 messages for LLM context)",
@@ -140,7 +142,7 @@ class BookingRequest(BaseModel):
     model_config = {"strict": True}
 
     group: str = Field(..., description="Group/class identifier")
-    datetime: datetime = Field(..., description="Booking datetime (timezone: Asia/Vladivostok)")
+    scheduled_at: datetime = Field(..., description="Booking datetime (timezone: Asia/Vladivostok)")
     client_name: str = Field(..., description="Client name")
     client_phone: str = Field(..., description="Client phone number")
     confirmation: bool = Field(..., description="Explicit confirmation (must be True)")

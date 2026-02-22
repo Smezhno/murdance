@@ -92,13 +92,17 @@ class ImpulseCache:
         await redis_storage.delete(key)
 
     async def clear_entity(self, entity: str) -> None:
-        """Clear all cache for entity (pattern delete).
+        """Clear all cache for entity (pattern delete + base key).
 
         Args:
             entity: Entity name
         """
+        # Delete keys with suffix (e.g., impulse:cache:schedule:2026-02-13_None_None)
         pattern = f"impulse:cache:{entity}:*"
         await redis_storage.scan_delete(pattern)
+        # Also delete the base key without suffix (e.g., impulse:cache:groups)
+        base_key = f"impulse:cache:{entity}"
+        await redis_storage.delete(base_key)
 
 
 @lru_cache()

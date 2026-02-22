@@ -3,7 +3,6 @@
 Per CONTRACT §5: HTTP Basic auth, retry with tenacity, circuit breaker.
 """
 
-import base64
 import time
 from functools import lru_cache
 from typing import Any
@@ -78,17 +77,16 @@ class ImpulseClient:
         self.settings = get_settings()
         self.tenant = self.settings.crm_tenant
         self.api_key = self.settings.crm_api_key
-        self.base_url = f"https://{self.tenant}.impulsecrm.ru/api"
+        self.base_url = f"https://{self.tenant}.impulsecrm.ru/api/public"
         self.circuit_breaker = CircuitBreaker()
         self._client: httpx.AsyncClient | None = None
 
     async def _get_client(self) -> httpx.AsyncClient:
         """Get or create httpx client."""
         if self._client is None:
-            # Create Basic auth header
-            auth_string = base64.b64encode(f"{self.api_key}:".encode()).decode()
+            # Impulse CRM uses non-standard Basic auth: raw key, not base64-encoded
             headers = {
-                "Authorization": f"Basic {auth_string}",
+                "Authorization": f"Basic {self.api_key}",
                 "Content-Type": "application/json",
             }
             self._client = httpx.AsyncClient(
@@ -186,7 +184,9 @@ class ImpulseClient:
         response = await self._request("POST", entity, "list", data)
         result = response.json()
 
-        # Handle response format
+        # Handle response format — Impulse CRM uses "items" key
+        if isinstance(result, dict) and "items" in result:
+            return result["items"]
         if isinstance(result, dict) and "data" in result:
             return result["data"]
         if isinstance(result, list):
@@ -218,6 +218,23 @@ class ImpulseClient:
         """
         response = await self._request("POST", entity, "update", data)
         return response.json()
+
+    async def create_tolerant(self, entity: str, data: dict[str, Any]) -> httpx.Response:
+        """Create entity returning raw Response (no raise_for_status).
+
+        Use when caller needs to inspect error body (e.g. duplicate-client 500).
+
+        Args:
+            entity: Entity name
+            data: Entity data
+
+        Returns:
+            Raw httpx.Response (may be 4xx/5xx)
+        """
+        client = await self._get_client()
+        url = f"/{entity}/update"
+        response = await client.post(url, json=data)
+        return response
 
     async def update(self, entity: str, entity_id: int, data: dict[str, Any]) -> dict[str, Any]:
         """Update entity (CONTRACT §5).

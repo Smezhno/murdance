@@ -36,6 +36,7 @@ class Settings(BaseSettings):
     # CRM Impulse configuration (CONTRACT §5)
     crm_tenant: str = Field(..., description="Impulse CRM tenant (e.g., 'studio')")
     crm_api_key: str = Field(..., description="Impulse CRM API key for HTTP Basic auth")
+    crm_branch_id: int | None = Field(None, description="Impulse CRM branch ID filter (None = all branches)")
 
     # Telegram configuration (CONTRACT §19)
     telegram_bot_token: str = Field(..., description="Telegram bot token")
@@ -101,7 +102,7 @@ class Settings(BaseSettings):
     @property
     def crm_base_url(self) -> str:
         """Construct Impulse CRM base URL (CONTRACT §5)."""
-        return f"https://{self.crm_tenant}.impulsecrm.ru/api"
+        return f"https://{self.crm_tenant}.impulsecrm.ru/api/public"
 
 
 @lru_cache()

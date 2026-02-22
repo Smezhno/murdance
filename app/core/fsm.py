@@ -21,6 +21,7 @@ def can_transition(from_state: ConversationState, to_state: ConversationState) -
     transitions: dict[ConversationState, list[ConversationState]] = {
         ConversationState.IDLE: [
             ConversationState.COLLECTING_INTENT,
+            ConversationState.BROWSING_SCHEDULE,
             ConversationState.CANCEL_FLOW,
             ConversationState.HANDOFF_TO_ADMIN,
         ],
@@ -29,6 +30,7 @@ def can_transition(from_state: ConversationState, to_state: ConversationState) -
             ConversationState.COLLECTING_GROUP,
             ConversationState.COLLECTING_DATETIME,  # Slot-skipping: user provides datetime directly
             ConversationState.COLLECTING_CONTACT,  # Slot-skipping: user provides contact directly
+            ConversationState.CONFIRM_BOOKING,  # Slot-skipping: all slots filled at once
             ConversationState.IDLE,
             ConversationState.CANCEL_FLOW,
             ConversationState.HANDOFF_TO_ADMIN,

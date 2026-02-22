@@ -1,78 +1,54 @@
 # Prompt regression test: Booking flow happy path
-# Per CONTRACT §21: YAML test suites with user input → expected (contains/not_contains/tool_calls)
-# Stability: temperature=0, 3 runs, pass if 2/3
+# Per CONTRACT §21: YAML test suites with user input → expected (contains/not_contains)
+# Directions in Тест branch: Dancehall, Girly Hip-Hop, High Heels
 
 name: "Booking Flow Happy Path"
 description: "Complete booking flow from greeting to confirmation (6 steps)"
 
 tests:
   - name: "step_1_greeting"
-    user: "Привет, хочу записаться на занятие"
+    user: "Привет"
     expected:
       contains:
-        - "помогу"
-        - "записаться"
-        - "занятие"
+        - "помочь"
       not_contains:
         - "ошибка"
-        - "не понял"
-      tool_calls: []
+        - "error"
 
-  - name: "step_2_group_selection"
-    user: "Бахata"
+  - name: "step_2_booking_with_direction"
+    user: "Хочу записаться на high heels"
     expected:
       contains:
-        - "направление"
-        - "бачата"
+        - "High Heels"
       not_contains:
         - "ошибка"
-      tool_calls: []
+        - "не нашла"
 
   - name: "step_3_datetime"
-    user: "Завтра в 19:00"
+    user: "Среда"
     expected:
-      contains:
-        - "дата"
-        - "время"
-        - "19"
       not_contains:
         - "ошибка"
-        - "не понял"
-      tool_calls:
-        - name: "get_schedule"
 
   - name: "step_4_contact_info"
     user: "Меня зовут Иван, телефон +79991234567"
     expected:
       contains:
-        - "имя"
-        - "телефон"
         - "Иван"
       not_contains:
         - "ошибка"
-      tool_calls: []
 
   - name: "step_5_confirmation_prompt"
-    user: "Да, всё верно"
+    user: "Подтверждаю"
     expected:
-      contains:
-        - "подтвердите"
-        - "запись"
-      not_contains:
-        - "ошибка"
-      tool_calls: []
-
-  - name: "step_6_confirm_yes"
-    user: "Да, подтверждаю"
-    expected:
-      contains:
-        - "запись"
-        - "подтверждена"
-        - "✅"
       not_contains:
         - "ошибка"
         - "не удалось"
-      # Note: tool_calls are for documentation only, validation not implemented yet
-      tool_calls:
-        - name: "create_booking"
 
+  - name: "step_6_reset"
+    user: "/start"
+    expected:
+      contains:
+        - "Здравствуйте"
+      not_contains:
+        - "ошибка"

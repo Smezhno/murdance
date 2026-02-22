@@ -16,14 +16,58 @@ from pydantic import BaseModel, Field, field_validator
 from app.config import get_settings
 
 
+class Hall(BaseModel):
+    """Hall within a branch."""
+
+    name: str = Field(..., description="Hall description (name + capacity)")
+
+
+class Branch(BaseModel):
+    """Studio branch (филиал)."""
+
+    name: str = Field(..., description="Branch name")
+    address: str = Field(..., description="Branch address")
+    phone: str = Field(..., description="Branch phone number(s)")
+    halls: list[str] = Field(default_factory=list, description="Hall descriptions")
+
+
 class StudioInfo(BaseModel):
     """Studio information section."""
 
+    model_config = {"populate_by_name": True}
+
     name: str = Field(..., description="Studio name")
-    address: str = Field(..., description="Studio address")
-    phone: str = Field(..., description="Studio phone number")
+    # address/phone may be derived from branches if not set directly
+    address: str = Field(default="", description="Studio address (or see branches)")
+    phone: str = Field(default="", description="Studio phone number (or see branches)")
     schedule: str = Field(..., description="General schedule description")
     timezone: str = Field(default="Asia/Vladivostok", description="Timezone")
+    branches: list[Branch] | None = Field(default=None, description="Studio branches")
+    contacts: dict[str, str] | None = Field(default=None, description="Social/contact links")
+    booking_branch: str | None = Field(
+        default=None,
+        description="Name of the branch currently enabled for CRM booking (None = all branches)",
+    )
+
+    @classmethod
+    def model_post_init(cls, __context: Any) -> None:
+        pass
+
+    def __init__(self, **data: Any) -> None:
+        # If address/phone not provided directly, derive from first branch
+        if not data.get("address") and data.get("branches"):
+            first = data["branches"][0]
+            if isinstance(first, dict):
+                data["address"] = first.get("address", "")
+            elif hasattr(first, "address"):
+                data["address"] = first.address
+        if not data.get("phone") and data.get("branches"):
+            first = data["branches"][0]
+            if isinstance(first, dict):
+                data["phone"] = first.get("phone", "")
+            elif hasattr(first, "phone"):
+                data["phone"] = first.phone
+        super().__init__(**data)
 
 
 class Tone(BaseModel):
@@ -33,6 +77,7 @@ class Tone(BaseModel):
     pronouns: str = Field(..., description="Pronouns to use")
     emoji: bool = Field(default=True, description="Allow emoji")
     language: str = Field(default="ru", description="Language code")
+    examples: list[str] = Field(default_factory=list, description="Example bot phrases")
 
 
 class Service(BaseModel):
@@ -51,6 +96,7 @@ class Teacher(BaseModel):
     name: str = Field(..., description="Teacher name")
     styles: list[str] = Field(..., description="Dance styles")
     specialization: str = Field(..., description="Specialization/bio")
+    bio: str | None = Field(default=None, description="Extended bio / background")
 
     @field_validator("styles")
     @classmethod
@@ -109,11 +155,13 @@ class ScheduleEntry(BaseModel):
 class Subscription(BaseModel):
     """Subscription/abonement definition."""
 
-    id: str = Field(..., description="Subscription ID")
+    id: str | None = Field(None, description="Subscription ID (optional, defaults to slugified name)")
     name: str = Field(..., description="Subscription name")
     classes: int = Field(..., description="Number of classes (-1 for unlimited)")
     price: float = Field(..., description="Price in rubles")
     validity_days: int = Field(..., description="Validity period in days")
+    category: str | None = Field(None, description="Subscription category")
+    note: str | None = Field(None, description="Additional note (e.g. promo condition)")
 
 
 class Policy(BaseModel):
@@ -123,6 +171,9 @@ class Policy(BaseModel):
     trial_class: str = Field(..., description="Trial class policy")
     what_to_bring: str = Field(..., description="What to bring to class")
     late_arrival: str = Field(..., description="Late arrival policy")
+    general_rules: str | None = Field(default=None, description="General studio rules")
+    hall_rental: str | None = Field(default=None, description="Hall rental policy and pricing")
+    other: str | None = Field(default=None, description="Other policies / studio facts")
 
 
 class Escalation(BaseModel):
@@ -145,6 +196,7 @@ class KnowledgeBase(BaseModel):
     faq: list[FAQ] = Field(default_factory=list, description="FAQ entries")
     holidays: list[Holiday] = Field(default_factory=list, description="Holiday periods")
     escalation: Escalation = Field(..., description="Escalation configuration")
+    additional: dict[str, str] | None = Field(default=None, description="Additional info (promotions, tips, etc.)")
 
     @field_validator("schema_version")
     @classmethod
@@ -319,13 +371,35 @@ class KnowledgeBase(BaseModel):
 
     def format_for_llm(self) -> str:
         """Format full KB context for system prompt."""
-        lines = [
-            f"Студия: {self.studio.name}",
-            f"Адрес: {self.studio.address}",
-            f"Телефон: {self.studio.phone}",
-            f"\nНаправления:",
-        ]
+        lines = [f"Студия: {self.studio.name}"]
 
+        # Booking restriction notice
+        if self.studio.booking_branch:
+            lines.append(
+                f"\n⚠️ ВАЖНО: Запись через бота сейчас доступна ТОЛЬКО в филиал «{self.studio.booking_branch}». "
+                "Отвечай на вопросы о других филиалах и преподавателях, но при попытке записаться "
+                f"— бронируй только в «{self.studio.booking_branch}». "
+                "Если клиент хочет в другой филиал — сообщи что запись туда откроется позже, "
+                "и предложи записаться в доступный филиал или связаться с администратором."
+            )
+
+        # Branches or single address
+        if self.studio.branches:
+            lines.append("\nФилиалы:")
+            for b in self.studio.branches:
+                halls_str = ", ".join(b.halls) if b.halls else ""
+                halls_part = f" | Залы: {halls_str}" if halls_str else ""
+                lines.append(f"- {b.name}: {b.address}, тел. {b.phone}{halls_part}")
+        else:
+            lines.append(f"Адрес: {self.studio.address}")
+            lines.append(f"Телефон: {self.studio.phone}")
+
+        # Contacts
+        if self.studio.contacts:
+            contacts_str = ", ".join(f"{k}: {v}" for k, v in self.studio.contacts.items())
+            lines.append(f"Контакты: {contacts_str}")
+
+        lines.append("\nНаправления:")
         for service in self.services:
             price_info = f"{service.price_single}₽" if service.price_single else "цена уточняется"
             lines.append(f"- {service.name} ({service.id}): {service.description}. Разовое занятие: {price_info}")
@@ -333,13 +407,18 @@ class KnowledgeBase(BaseModel):
         lines.append("\nПреподаватели:")
         for teacher in self.teachers:
             styles_str = ", ".join(teacher.styles)
-            lines.append(f"- {teacher.name} ({teacher.id}): {styles_str}. {teacher.specialization}")
+            bio_part = f" {teacher.bio}" if teacher.bio else ""
+            lines.append(f"- {teacher.name}: {styles_str}. {teacher.specialization}{bio_part}")
 
         if self.subscriptions:
             lines.append("\nАбонементы:")
             for sub in self.subscriptions:
                 classes_str = "безлимит" if sub.classes == -1 else f"{sub.classes} занятий"
-                lines.append(f"- {sub.name}: {sub.price}₽ ({classes_str}, действует {sub.validity_days} дней)")
+                note_part = f" ({sub.note})" if sub.note else ""
+                cat_part = f" [{sub.category}]" if sub.category else ""
+                lines.append(
+                    f"- {sub.name}{cat_part}: {sub.price}₽ ({classes_str}, действует {sub.validity_days} дней){note_part}"
+                )
 
         lines.append("\n" + self.format_schedule_text())
 
@@ -349,11 +428,22 @@ class KnowledgeBase(BaseModel):
             lines.append(f"- Пробное занятие: {self.policies.trial_class}")
             lines.append(f"- Что взять с собой: {self.policies.what_to_bring}")
             lines.append(f"- Опоздание: {self.policies.late_arrival}")
+            if self.policies.general_rules:
+                lines.append(f"- Общие правила: {self.policies.general_rules}")
+            if self.policies.hall_rental:
+                lines.append(f"- Аренда зала: {self.policies.hall_rental}")
+            if self.policies.other:
+                lines.append(f"- Прочее: {self.policies.other}")
 
         if self.faq:
             lines.append("\nЧастые вопросы:")
             for faq in self.faq[:5]:  # Limit to first 5 for brevity
                 lines.append(f"Q: {faq.q}\nA: {faq.a}")
+
+        if self.additional:
+            lines.append("\nДополнительно:")
+            for key, val in self.additional.items():
+                lines.append(f"- {key}: {val}")
 
         return "\n".join(lines)
 
