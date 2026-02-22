@@ -144,9 +144,22 @@ class BookingFlow:
             conversation_history=history,
         )
         intent = intent_result.get("intent", "unclear")
+        slots = intent_result.get("slots", {})
 
         if intent == "booking":
+            # Guard: if LLM extracted new group/datetime, user wants a different booking —
+            # don't confirm current one; reset and start fresh.
+            new_group = slots.get("group")
+            new_datetime = slots.get("datetime")
+            if new_group or new_datetime:
+                await self._reset_session(session)
+                non_null = {k: v for k, v in slots.items() if v is not None}
+                if non_null:
+                    await update_slots(session, **non_null)
+                await transition_state(session, ConversationState.COLLECTING_INTENT)
+                return await generate_response("ask_direction", {}, trace_id, history)
             return await confirm_booking(session, trace_id, self.impulse, self.kb)
+
         if intent in ("cancel",):
             await self._reset_session(session)
             return await generate_response("booking_cancelled", {}, trace_id, history)
@@ -186,16 +199,13 @@ class BookingFlow:
             if non_null:
                 await update_slots(session, **non_null)
 
-            # If direction already known — show its schedule right away
+            # If direction already known — show its schedule right away (no second LLM call)
             group = slots.get("group") or session.slots.group
             if group and not session.slots.datetime_resolved:
                 sched = await generate_schedule_response(
                     self.impulse, {"group": group}, trace_id, message.text
                 )
-                return await generate_response(
-                    "show_schedule", {"group": group, "schedule_text": sched},
-                    trace_id, history,
-                )
+                return f"{sched}\n\nК кому хочешь записаться? 😊"
 
             if all_slots_filled(session):
                 await transition_state(session, ConversationState.CONFIRM_BOOKING)
@@ -216,7 +226,11 @@ class BookingFlow:
         if intent in ("unsure", "help"):
             return await generate_response("suggest_trial", {}, trace_id, history)
 
-        # Info, greeting — use LLM-generated response
+        # Greeting — use studio-tone LLM response
+        if intent == "greeting":
+            return await generate_response("greet", {}, trace_id, history)
+
+        # Info — use LLM-generated response from resolve_intent
         return intent_result.get("response_text") or await generate_response("greet", {}, trace_id, history)
 
     async def _reset_session(self, session: Any) -> None:
