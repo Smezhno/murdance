@@ -218,20 +218,19 @@ class BookingFlow:
                 missing = get_missing_slots(session)
                 return await _ask_next_slot(missing, session, trace_id, history)
 
-            # Teacher known but group unknown — look up group from CRM schedule
+            # Teacher known but group unknown — show teacher's schedule from CRM
             if session.slots.teacher and not session.slots.group:
                 try:
                     schedules = await self.impulse.get_schedule()
                     teacher_lower = session.slots.teacher.lower()
-                    for s in schedules:
-                        t_name = getattr(s, "teacher_name", None) or ""
-                        if teacher_lower in t_name.lower():
-                            group_name = getattr(s, "style_name", None)
-                            if group_name:
-                                await update_slots(session, group=group_name)
-                                missing = get_missing_slots(session)
-                                return await _ask_next_slot(missing, session, trace_id, history)
-                            break
+                    teacher_schedules = [
+                        s for s in schedules
+                        if teacher_lower in (getattr(s, "teacher_name", None) or "").lower()
+                    ]
+                    if teacher_schedules:
+                        from app.core.schedule_flow import format_schedule
+                        sched_text = format_schedule(schedules, teacher_filter=teacher_lower)
+                        return f"{sched_text}\n\nКакое время тебе подходит? 😊"
                 except Exception:
                     pass
 
@@ -253,6 +252,27 @@ class BookingFlow:
         # Greeting — use studio-tone LLM response
         if intent == "greeting":
             return await generate_response("greet", {}, trace_id, history)
+
+        # Info about a specific teacher — look up from KB + CRM schedule
+        teacher_from_slots = slots.get("teacher")
+        if not teacher_from_slots:
+            teacher_from_slots = self.kb.resolve_teacher(message.text)
+            if teacher_from_slots:
+                teacher_from_slots = teacher_from_slots.name
+        if teacher_from_slots:
+            try:
+                schedules = await self.impulse.get_schedule()
+                teacher_lower = teacher_from_slots.lower()
+                teacher_schedules = [
+                    s for s in schedules
+                    if teacher_lower in (getattr(s, "teacher_name", None) or "").lower()
+                ]
+                if teacher_schedules:
+                    from app.core.schedule_flow import format_schedule
+                    sched_text = format_schedule(schedules, teacher_filter=teacher_lower)
+                    return f"{sched_text}\n\nХочешь записаться к {teacher_from_slots}? 😊"
+            except Exception:
+                pass
 
         # Info — use LLM-generated response from resolve_intent
         return intent_result.get("response_text") or await generate_response("greet", {}, trace_id, history)

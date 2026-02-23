@@ -20,12 +20,6 @@ class Settings(BaseSettings):
         extra="ignore",
     )
 
-    # Redis configuration (CONTRACT §3)
-    redis_host: str = Field(default="localhost", description="Redis host")
-    redis_port: int = Field(default=6379, description="Redis port")
-    redis_password: str = Field(default="", description="Redis password (requirepass)")
-    redis_db: int = Field(default=0, description="Redis database number")
-
     # PostgreSQL configuration (CONTRACT §3)
     postgres_host: str = Field(default="localhost", description="PostgreSQL host")
     postgres_port: int = Field(default=5432, description="PostgreSQL port")
@@ -83,13 +77,6 @@ class Settings(BaseSettings):
     # Application settings
     app_name: str = Field(default="DanceBot", description="Application name")
     log_level: str = Field(default="INFO", description="Logging level")
-
-    @property
-    def redis_url(self) -> str:
-        """Construct Redis URL."""
-        if self.redis_password:
-            return f"redis://:{self.redis_password}@{self.redis_host}:{self.redis_port}/{self.redis_db}"
-        return f"redis://{self.redis_host}:{self.redis_port}/{self.redis_db}"
 
     @property
     def postgres_url(self) -> str:

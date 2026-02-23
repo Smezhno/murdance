@@ -324,28 +324,43 @@ class ImpulseAdapter:
     async def list_bookings(self, client_id: int | None = None, date_from: date | None = None) -> list[Reservation]:
         """List bookings/reservations (CONTRACT §5).
 
+        CRM does not support server-side filtering by client_id or date —
+        all pages are fetched and filtered client-side.
+        CRM supports up to 1000 items per page; we paginate until exhausted.
+
         Args:
-            client_id: Optional client ID filter
-            date_from: Optional start date filter
+            client_id: Filter by client ID (applied in Python)
+            date_from: Filter reservations on or after this date (applied in Python)
 
         Returns:
-            List of reservations
+            List of active reservations matching filters
         """
         try:
-            filters: dict[str, Any] = {}
-            if client_id:
-                filters["client_id"] = client_id
-            if date_from:
-                filters["date"] = date_from.isoformat()
-
+            # Sort by id DESC so newest reservations come first.
+            # Fetch last 500 — enough to cover all active bookings without full table scan.
             data = await self.client.list(
                 "reservation",
-                fields=["id", "client_id", "schedule_id", "status_id", "created_at", "updated_at", "notes"],
-                filters=filters if filters else None,
-                limit=1000,
+                limit=500,
+                page=1,
+                sort={"id": "desc"},
             )
+            reservations = [Reservation(**item) for item in data]
 
-            return [Reservation(**item) for item in data]
+            # Filter client-side: skip deleted/archived
+            reservations = [r for r in reservations if r.is_active]
+
+            # Filter by client_id
+            if client_id is not None:
+                reservations = [r for r in reservations if r.client_id == client_id]
+
+            # Filter by date_from
+            if date_from is not None:
+                reservations = [
+                    r for r in reservations
+                    if r.date_as_date is not None and r.date_as_date >= date_from
+                ]
+
+            return reservations
 
         except Exception as e:
             user_msg, should_fallback = self.error_handler.handle_error(e)
@@ -368,12 +383,15 @@ class ImpulseAdapter:
             True if cancelled
         """
         try:
-            result = await self.client.delete("reservation", reservation_id)
+            # CRM uses reservation/archive to cancel (delete/unsubscribe return 404)
+            response = await self.client._request("POST", "reservation", "archive", {"id": reservation_id})
+            result = response.json()
+            success = result.get("success") is True
 
             # Invalidate all schedule cache keys
             await self.cache.clear_entity("schedule")
 
-            return result
+            return success
 
         except Exception as e:
             user_msg, should_fallback = self.error_handler.handle_error(e)

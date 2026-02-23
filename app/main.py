@@ -9,30 +9,31 @@ from fastapi import FastAPI, Request, Response, status
 from fastapi.responses import JSONResponse
 
 from app.channels.dedup import is_duplicate
-from app.channels.filters import should_process, get_non_text_reply
+from app.channels.filters import get_non_text_reply, should_process
 from app.channels.telegram import get_telegram_channel
 from app.config import get_settings
+from app.queue.outbound import enqueue_message
 from app.storage.postgres import postgres_storage
-from app.storage.redis import redis_storage
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan: connect/disconnect storage."""
-    # Startup
-    await redis_storage.connect()
+    # Startup: run migrations, validate KB, start cleanup scheduler
     await postgres_storage.connect()
-    await postgres_storage.create_tables()
 
-    # Load knowledge base (CONTRACT §15: must fail-fast on invalid schema)
     from app.knowledge.base import load_knowledge_base
 
     load_knowledge_base()  # Raises if invalid - app must not start
 
+    from app.core.cleanup import start_scheduler
+
+    scheduler = start_scheduler()
+
     yield
 
     # Shutdown
-    await redis_storage.disconnect()
+    scheduler.shutdown(wait=False)
     await postgres_storage.disconnect()
 
 
@@ -83,35 +84,41 @@ async def telegram_webhook(request: Request) -> Response:
 
         # Filter non-text messages (CONTRACT §8)
         if not should_process(message):
-            # Send friendly reply but don't process
-            await telegram_channel.send_non_text_reply(message.chat_id, message)
+            # Enqueue friendly reply via outbound_queue (CONTRACT §9)
+            reply_text = get_non_text_reply(message)
+            await enqueue_message(
+                chat_id=message.chat_id,
+                channel=message.channel,
+                text=reply_text,
+                trace_id=message.trace_id,
+            )
             return Response(status_code=status.HTTP_200_OK)
 
-        # Send typing indicator before processing
+        # Typing indicator: sent directly — it's a real-time signal that
+        # would be stale by the time the worker processes it from the queue.
         await telegram_channel.send_typing(message.chat_id)
 
         # Process message through booking flow (CONTRACT §6, §7, §11)
         from app.core.booking_flow import get_booking_flow
-        from uuid import uuid4
 
         booking_flow = get_booking_flow()
         response_text = await booking_flow.process_message(message, message.trace_id)
 
-        # Send response
-        await telegram_channel.send_message(message.chat_id, response_text)
-
-        # Generate outbound message_id
-        outbound_message_id = f"out_{uuid4().hex[:12]}"
+        # Enqueue response via outbound_queue (CONTRACT §9)
+        queue_id = await enqueue_message(
+            chat_id=message.chat_id,
+            channel=message.channel,
+            text=response_text,
+            trace_id=message.trace_id,
+        )
 
         # Log outbound message (CONTRACT §17)
-        # TODO: Phase 4 - Outbound messages should go through Redis queue per CONTRACT §9
-        # For now, send directly and log
         await postgres_storage.log_message(
             trace_id=message.trace_id,
             channel=message.channel,
             chat_id=message.chat_id,
-            message_id=outbound_message_id,
-            timestamp=message.timestamp,  # Use same timestamp for now
+            message_id=str(queue_id),
+            timestamp=message.timestamp,
             text=response_text,
             message_type="text",
             direction="outbound",
@@ -138,17 +145,8 @@ async def telegram_webhook(request: Request) -> Response:
 async def health_check() -> JSONResponse:
     """Health check endpoint (CONTRACT §22).
 
-    Returns: {status, redis, postgres, crm}
+    Returns: {status, postgres, crm, pool_stats}
     """
-    settings = get_settings()
-
-    # Check Redis
-    redis_healthy = False
-    try:
-        redis_healthy = await redis_storage.health_check()
-    except Exception:
-        pass
-
     # Check Postgres
     postgres_healthy = False
     try:
@@ -166,16 +164,21 @@ async def health_check() -> JSONResponse:
     except Exception:
         pass
 
-    # Overall status
-    overall_status = "healthy" if (redis_healthy and postgres_healthy and crm_healthy) else "degraded"
+    pool = {}
+    try:
+        pool = postgres_storage.pool_stats()
+    except Exception:
+        pass
+
+    overall_status = "healthy" if (postgres_healthy and crm_healthy) else "degraded"
 
     return JSONResponse(
         status_code=status.HTTP_200_OK if overall_status == "healthy" else status.HTTP_503_SERVICE_UNAVAILABLE,
         content={
             "status": overall_status,
-            "redis": "healthy" if redis_healthy else "unhealthy",
             "postgres": "healthy" if postgres_healthy else "unhealthy",
             "crm": "healthy" if crm_healthy else "unhealthy",
+            "pool": pool,
         },
     )
 

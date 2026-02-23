@@ -10,10 +10,26 @@ from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
+import pymorphy3
 import yaml
 from pydantic import BaseModel, Field, field_validator
 
 from app.config import get_settings
+
+_morph = pymorphy3.MorphAnalyzer()
+
+
+def _normalize_ru(text: str) -> str:
+    """Normalize Russian/English text to base lemma form for fuzzy matching."""
+    words = text.lower().strip().split()
+    lemmas = []
+    for word in words:
+        parsed = _morph.parse(word)
+        if parsed:
+            lemmas.append(parsed[0].normal_form)
+        else:
+            lemmas.append(word)
+    return " ".join(lemmas)
 
 
 class Hall(BaseModel):
@@ -87,6 +103,7 @@ class Service(BaseModel):
     name: str = Field(..., description="Service name")
     description: str = Field(..., description="Service description")
     price_single: float | None = Field(default=None, description="Single class price")
+    aliases: list[str] = Field(default_factory=list, description="Alternative names and spellings")
 
 
 class Teacher(BaseModel):
@@ -97,6 +114,7 @@ class Teacher(BaseModel):
     styles: list[str] = Field(..., description="Dance styles")
     specialization: str = Field(..., description="Specialization/bio")
     bio: str | None = Field(default=None, description="Extended bio / background")
+    aliases: list[str] = Field(default_factory=list, description="Alternative names and nicknames")
 
     @field_validator("styles")
     @classmethod
@@ -246,6 +264,35 @@ class KnowledgeBase(BaseModel):
         for service in self.services:
             if service.id == service_id:
                 return service
+        return None
+
+    def resolve_service(self, user_input: str) -> Service | None:
+        """Resolve service from user input including aliases, typos, and Russian inflections."""
+        normalized = _normalize_ru(user_input)
+
+        for service in self.services:
+            if normalized in (_normalize_ru(service.id), _normalize_ru(service.name)):
+                return service
+            for alias in service.aliases:
+                alias_norm = _normalize_ru(alias)
+                if alias_norm in normalized or normalized in alias_norm:
+                    return service
+        return None
+
+    def resolve_teacher(self, user_input: str) -> Teacher | None:
+        """Resolve teacher from user input including aliases and partial name matches."""
+        normalized = _normalize_ru(user_input)
+
+        for teacher in self.teachers:
+            if normalized in (_normalize_ru(teacher.id), _normalize_ru(teacher.name)):
+                return teacher
+            for name_part in teacher.name.split():
+                if _normalize_ru(name_part) in normalized:
+                    return teacher
+            for alias in teacher.aliases:
+                alias_norm = _normalize_ru(alias)
+                if alias_norm in normalized or normalized in alias_norm:
+                    return teacher
         return None
 
     def get_teacher_by_id(self, teacher_id: str) -> Teacher | None:
@@ -402,13 +449,15 @@ class KnowledgeBase(BaseModel):
         lines.append("\nНаправления:")
         for service in self.services:
             price_info = f"{service.price_single}₽" if service.price_single else "цена уточняется"
-            lines.append(f"- {service.name} ({service.id}): {service.description}. Разовое занятие: {price_info}")
+            aliases_part = f" | Также: {', '.join(service.aliases)}" if service.aliases else ""
+            lines.append(f"- {service.name} ({service.id}){aliases_part}: {service.description}. Разовое занятие: {price_info}")
 
         lines.append("\nПреподаватели:")
         for teacher in self.teachers:
             styles_str = ", ".join(teacher.styles)
             bio_part = f" {teacher.bio}" if teacher.bio else ""
-            lines.append(f"- {teacher.name}: {styles_str}. {teacher.specialization}{bio_part}")
+            aliases_part = f" | Имена: {', '.join(teacher.aliases)}" if teacher.aliases else ""
+            lines.append(f"- {teacher.name}: {styles_str}. {teacher.specialization}{bio_part}{aliases_part}")
 
         if self.subscriptions:
             lines.append("\nАбонементы:")

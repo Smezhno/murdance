@@ -189,8 +189,8 @@ class TestRunner:
             print(f"  Passed: {results['passed']}/{results['total_tests']}\n")
 
             # Cleanup between test suites: reset session for test_chat
-            from app.storage.redis import redis_storage
-            await redis_storage.delete("session:telegram:test_chat")
+            from app.storage.session_store import delete_session
+            await delete_session("telegram", "test_chat")
 
         # Calculate suite pass rate
         pass_rate = total_passed / total_tests if total_tests > 0 else 0.0
@@ -210,22 +210,16 @@ class TestRunner:
 
 async def main() -> int:
     """Main entry point."""
-    # Setup: initialize Redis connection and load KB
-    from app.storage.redis import redis_storage
     from app.knowledge.base import load_knowledge_base
-
     from app.storage.postgres import postgres_storage
 
     try:
-        await redis_storage.connect()
         await postgres_storage.connect()
         load_knowledge_base()  # Raises if invalid - test must not start
 
         runner = TestRunner()
         exit_code = await runner.run_all_suites()
 
-        # Teardown
-        await redis_storage.disconnect()
         await postgres_storage.disconnect()
 
         return exit_code

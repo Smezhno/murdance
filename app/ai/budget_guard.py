@@ -1,155 +1,181 @@
-"""Budget Guard: token/cost limits with Redis counters.
+"""Budget Guard: token/cost limits backed by PostgreSQL budget_counters.
 
-Per CONTRACT §12: All 4 limits with Redis counters, auto-shutdown on breach.
+Per CONTRACT §12: All 4 hard limits with atomic PG counters, auto-shutdown on breach.
+Per RFC-002 §3.2.4: INSERT ... ON CONFLICT DO UPDATE replaces Redis INCRBY.
+
+Schema (migrations/001_redis_to_postgres.sql):
+    budget_counters PRIMARY KEY (provider, "window", window_start)
+    columns: tokens_used, requests_count, errors_count, cost_usd
+    window: 'minute' | 'hour' | 'day'
+    window_start: TIMESTAMPTZ truncated to the window boundary
+
+Key design decisions:
+- One row per (provider, window_granularity, window_start_time).
+  All four metrics for a given provider+window share one row.
+- INCREMENT is atomic: INSERT ... ON CONFLICT DO UPDATE SET col = col + $n RETURNING col.
+- CHECK reads the just-incremented value from the same statement — no race window.
+- Rows are retained for 7 days for trend analysis, swept by periodic cleanup job.
 """
 
+import logging
+from datetime import datetime, timezone
 from functools import lru_cache
-from datetime import datetime, timedelta, timezone
 
 from app.config import get_settings
-from app.storage.redis import redis_storage
+from app.storage.postgres import postgres_storage as db
+
+logger = logging.getLogger(__name__)
+
+# Provider label used for aggregated budget tracking.
+_PROVIDER = "all"
+
+
+def _hour_start() -> datetime:
+    return datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0)
+
+
+def _day_start() -> datetime:
+    now = datetime.now(timezone.utc)
+    return now.replace(hour=0, minute=0, second=0, microsecond=0)
+
+
+def _minute_start() -> datetime:
+    return datetime.now(timezone.utc).replace(second=0, microsecond=0)
+
+
+async def _increment(
+    window: str,
+    window_start: datetime,
+    *,
+    tokens: int = 0,
+    requests: int = 0,
+    errors: int = 0,
+    cost_usd: float = 0.0,
+) -> dict:
+    """Atomically upsert budget_counters and return the updated row values.
+
+    RFC-002 §3.2.4: INSERT ... ON CONFLICT DO UPDATE SET col = col + excluded_col
+    RETURNING gives the post-increment values in one round-trip.
+    """
+    row = await db.fetchrow(
+        """
+        INSERT INTO budget_counters
+            (provider, "window", window_start,
+             tokens_used, requests_count, errors_count, cost_usd)
+        VALUES ($1, $2, $3, $4, $5, $6, $7)
+        ON CONFLICT (provider, "window", window_start) DO UPDATE SET
+            tokens_used    = budget_counters.tokens_used    + EXCLUDED.tokens_used,
+            requests_count = budget_counters.requests_count + EXCLUDED.requests_count,
+            errors_count   = budget_counters.errors_count   + EXCLUDED.errors_count,
+            cost_usd       = budget_counters.cost_usd       + EXCLUDED.cost_usd,
+            updated_at     = NOW()
+        RETURNING tokens_used, requests_count, errors_count, cost_usd
+        """,
+        _PROVIDER, window, window_start,
+        tokens, requests, errors, cost_usd,
+    )
+    return dict(row)
+
+
+async def _read(window: str, window_start: datetime) -> dict:
+    """Read current counter values without incrementing (for is_breached())."""
+    row = await db.fetchrow(
+        """
+        SELECT tokens_used, requests_count, errors_count, cost_usd
+        FROM budget_counters
+        WHERE provider = $1 AND "window" = $2 AND window_start = $3
+        """,
+        _PROVIDER, window, window_start,
+    )
+    if row is None:
+        return {"tokens_used": 0, "requests_count": 0, "errors_count": 0, "cost_usd": 0.0}
+    return dict(row)
 
 
 class BudgetGuard:
-    """Budget guard with Redis counters (CONTRACT §12)."""
+    """Hard budget limits enforced via PostgreSQL atomic increments (CONTRACT §12).
+
+    Public API is identical to the Redis version — router.py needs no changes.
+    """
 
     def __init__(self) -> None:
-        """Initialize budget guard with limits from config."""
         self.settings = get_settings()
 
-    def _get_hour_key(self) -> str:
-        """Get Redis key for current hour."""
-        hour = datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0)
-        return f"budget:tokens:hour:{hour.isoformat()}"
-
-    def _get_day_key(self) -> str:
-        """Get Redis key for current day."""
-        day = datetime.now(timezone.utc).date()
-        return f"budget:cost:day:{day.isoformat()}"
-
-    def _get_minute_key(self) -> str:
-        """Get Redis key for current minute."""
-        minute = datetime.now(timezone.utc).replace(second=0, microsecond=0)
-        return f"budget:requests:minute:{minute.isoformat()}"
-
-    def _get_errors_hour_key(self) -> str:
-        """Get Redis key for current hour errors."""
-        hour = datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0)
-        return f"budget:errors:hour:{hour.isoformat()}"
-
     async def check_tokens_per_hour(self, tokens: int) -> tuple[bool, int]:
-        """Check if tokens per hour limit is not exceeded (CONTRACT §12).
+        """Increment tokens_used for the current hour and check the limit.
 
-        Args:
-            tokens: Tokens to add
-
-        Returns:
-            Tuple of (within_limit, current_count)
+        Returns (within_limit, new_total).
+        Increments BEFORE checking so the counter is always accurate.
         """
-        key = self._get_hour_key()
-        # Read current count first
-        current_str = await redis_storage.get(key)
-        current = int(current_str) if current_str else 0
-        
-        # Check limit before incrementing
-        if current + tokens > self.settings.max_tokens_per_hour:
-            await redis_storage.expire(key, 3600)  # Ensure TTL is set
-            return False, current
-        
-        # Increment only if within limit
-        new_count = await redis_storage.incr(key, tokens)
-        await redis_storage.expire(key, 3600)  # 1 hour TTL
-
-        return True, new_count
+        row = await _increment("hour", _hour_start(), tokens=tokens)
+        new_total = int(row["tokens_used"])
+        within = new_total <= self.settings.max_tokens_per_hour
+        if not within:
+            logger.warning(
+                "budget_guard: MAX_TOKENS_PER_HOUR breached total=%d limit=%d",
+                new_total, self.settings.max_tokens_per_hour,
+            )
+        return within, new_total
 
     async def check_cost_per_day(self, cost_usd: float) -> tuple[bool, float]:
-        """Check if cost per day limit is not exceeded (CONTRACT §12).
+        """Increment cost_usd for the current day and check the limit.
 
-        Args:
-            cost_usd: Cost in USD to add
-
-        Returns:
-            Tuple of (within_limit, current_cost_usd)
+        Returns (within_limit, new_total_usd).
         """
-        key = self._get_day_key()
-        # Store cost as integer (cents) for precision
-        cost_cents = int(cost_usd * 100)
-        
-        # Read current count first
-        current_cents_str = await redis_storage.get(key)
-        current_cents = int(current_cents_str) if current_cents_str else 0
-        current_usd = current_cents / 100.0
-        
-        # Check limit before incrementing
-        if current_usd + cost_usd > self.settings.max_cost_per_day_usd:
-            await redis_storage.expire(key, 86400)  # Ensure TTL is set
-            return False, current_usd
-        
-        # Increment only if within limit
-        new_cents = await redis_storage.incr(key, cost_cents)
-        await redis_storage.expire(key, 86400)  # 24 hours TTL
-
-        new_usd = new_cents / 100.0
-        return True, new_usd
+        row = await _increment("day", _day_start(), cost_usd=cost_usd)
+        new_total = float(row["cost_usd"])
+        within = new_total <= self.settings.max_cost_per_day_usd
+        if not within:
+            logger.warning(
+                "budget_guard: MAX_COST_PER_DAY_USD breached total=%.4f limit=%.2f",
+                new_total, self.settings.max_cost_per_day_usd,
+            )
+        return within, new_total
 
     async def check_requests_per_minute(self) -> tuple[bool, int]:
-        """Check if requests per minute limit is not exceeded (CONTRACT §12).
+        """Increment requests_count for the current minute and check the limit.
 
-        Returns:
-            Tuple of (within_limit, current_count)
+        Returns (within_limit, new_total).
         """
-        key = self._get_minute_key()
-        # Read current count first
-        current_str = await redis_storage.get(key)
-        current = int(current_str) if current_str else 0
-        
-        # Check limit before incrementing
-        if current + 1 > self.settings.max_requests_per_minute:
-            await redis_storage.expire(key, 60)  # Ensure TTL is set
-            return False, current
-        
-        # Increment only if within limit
-        new_count = await redis_storage.incr(key, 1)
-        await redis_storage.expire(key, 60)  # 1 minute TTL
-
-        return True, new_count
+        row = await _increment("minute", _minute_start(), requests=1)
+        new_total = int(row["requests_count"])
+        within = new_total <= self.settings.max_requests_per_minute
+        if not within:
+            logger.warning(
+                "budget_guard: MAX_REQUESTS_PER_MINUTE breached total=%d limit=%d",
+                new_total, self.settings.max_requests_per_minute,
+            )
+        return within, new_total
 
     async def record_error(self) -> bool:
-        """Record an error and check if errors per hour limit is exceeded (CONTRACT §12).
+        """Increment errors_count for the current hour.
 
-        Returns:
-            True if within limit, False if exceeded
+        Returns True if still within limit, False if breached.
         """
-        key = self._get_errors_hour_key()
-        current = await redis_storage.incr(key, 1)
-        await redis_storage.expire(key, 3600)  # 1 hour TTL
-
-        return current <= self.settings.max_errors_per_hour
+        row = await _increment("hour", _hour_start(), errors=1)
+        new_total = int(row["errors_count"])
+        within = new_total <= self.settings.max_errors_per_hour
+        if not within:
+            logger.warning(
+                "budget_guard: MAX_ERRORS_PER_HOUR breached total=%d limit=%d",
+                new_total, self.settings.max_errors_per_hour,
+            )
+        return within
 
     async def check_all_limits(self, tokens: int, cost_usd: float) -> tuple[bool, str]:
-        """Check all budget limits (CONTRACT §12).
+        """Check all four limits in priority order, incrementing as we go.
 
-        Checks limits FIRST, then increments only if within limits.
-
-        Args:
-            tokens: Tokens to check
-            cost_usd: Cost in USD to check
-
-        Returns:
-            Tuple of (within_limits, breach_reason)
-            breach_reason is empty string if within limits
+        Stops at the first breach so we don't double-count on a rejected call.
+        Returns (within_limits, breach_reason).
         """
-        # Check requests per minute (reads current, checks, then increments if OK)
         requests_ok, _ = await self.check_requests_per_minute()
         if not requests_ok:
             return False, "MAX_REQUESTS_PER_MINUTE exceeded"
 
-        # Check tokens per hour (reads current, checks, then increments if OK)
         tokens_ok, _ = await self.check_tokens_per_hour(tokens)
         if not tokens_ok:
             return False, "MAX_TOKENS_PER_HOUR exceeded"
 
-        # Check cost per day (reads current, checks, then increments if OK)
         cost_ok, _ = await self.check_cost_per_day(cost_usd)
         if not cost_ok:
             return False, "MAX_COST_PER_DAY_USD exceeded"
@@ -157,39 +183,23 @@ class BudgetGuard:
         return True, ""
 
     async def is_breached(self) -> bool:
-        """Check if any budget limit is currently breached.
+        """Return True if any limit is currently at or above its threshold.
 
-        Returns:
-            True if any limit is breached, False otherwise
+        Reads without incrementing — safe to call for health-check purposes.
         """
-        # Check current counters
-        tokens_key = self._get_hour_key()
-        cost_key = self._get_day_key()
-        requests_key = self._get_minute_key()
-        errors_key = self._get_errors_hour_key()
-
-        tokens_count = int(await redis_storage.get(tokens_key) or "0")
-        cost_cents = int(await redis_storage.get(cost_key) or "0")
-        requests_count = int(await redis_storage.get(requests_key) or "0")
-        errors_count = int(await redis_storage.get(errors_key) or "0")
-
-        cost_usd = cost_cents / 100.0
+        hour_row    = await _read("hour",   _hour_start())
+        day_row     = await _read("day",    _day_start())
+        minute_row  = await _read("minute", _minute_start())
 
         return (
-            tokens_count >= self.settings.max_tokens_per_hour
-            or cost_usd >= self.settings.max_cost_per_day_usd
-            or requests_count >= self.settings.max_requests_per_minute
-            or errors_count >= self.settings.max_errors_per_hour
+            int(hour_row["tokens_used"])      >= self.settings.max_tokens_per_hour
+            or float(day_row["cost_usd"])     >= self.settings.max_cost_per_day_usd
+            or int(minute_row["requests_count"]) >= self.settings.max_requests_per_minute
+            or int(hour_row["errors_count"])  >= self.settings.max_errors_per_hour
         )
-
-
-_budget_guard: BudgetGuard | None = None
 
 
 @lru_cache()
 def get_budget_guard() -> BudgetGuard:
-    """Get budget guard instance (lazy init)."""
-    global _budget_guard
-    if _budget_guard is None:
-        _budget_guard = BudgetGuard()
-    return _budget_guard
+    """Return the shared BudgetGuard instance (lazy, cached)."""
+    return BudgetGuard()

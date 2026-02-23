@@ -1,29 +1,13 @@
 services:
-  redis:
-    image: redis:7-alpine
-    container_name: dancebot-redis
-    ports:
-      - "6379:6379"
-    command: redis-server --requirepass ${REDIS_PASSWORD:-changeme} --appendonly yes
-    volumes:
-      - redis-data:/data
-    networks:
-      - dancebot-network
-    healthcheck:
-      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD:-changeme}", "ping"]
-      interval: 5s
-      timeout: 3s
-      retries: 5
-
   postgres:
     image: postgres:15-alpine
     container_name: dancebot-postgres
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-dancebot}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-changeme}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
       POSTGRES_DB: ${POSTGRES_DB:-dancebot}
-    ports:
-      - "5432:5432"
+    # No ports: block — app and worker reach postgres via dancebot-network.
+    # For local debug: add `127.0.0.1:5432:5432` in a docker-compose.override.yml.
     volumes:
       - postgres-data:/var/lib/postgresql/data
     networks:
@@ -39,20 +23,15 @@ services:
       context: .
       dockerfile: Dockerfile
     container_name: dancebot-app
-    environment:
-      - REDIS_HOST=redis
-      - REDIS_PORT=6379
-      - REDIS_PASSWORD=${REDIS_PASSWORD:-changeme}
-      - POSTGRES_HOST=postgres
-      - POSTGRES_PORT=5432
-      - POSTGRES_USER=${POSTGRES_USER:-dancebot}
-      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-changeme}
-      - POSTGRES_DB=${POSTGRES_DB:-dancebot}
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000
+    expose:
+      - "8000"
     env_file:
       - .env
+    environment:
+      # Override .env values that differ inside Docker network
+      POSTGRES_HOST: postgres
     depends_on:
-      redis:
-        condition: service_healthy
       postgres:
         condition: service_healthy
     networks:
@@ -62,22 +41,15 @@ services:
   worker:
     build:
       context: .
-      dockerfile: Dockerfile.worker
+      dockerfile: Dockerfile
     container_name: dancebot-worker
-    environment:
-      - REDIS_HOST=redis
-      - REDIS_PORT=6379
-      - REDIS_PASSWORD=${REDIS_PASSWORD:-changeme}
-      - POSTGRES_HOST=postgres
-      - POSTGRES_PORT=5432
-      - POSTGRES_USER=${POSTGRES_USER:-dancebot}
-      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-changeme}
-      - POSTGRES_DB=${POSTGRES_DB:-dancebot}
+    command: python -m worker.main
     env_file:
       - .env
+    environment:
+      # Override .env values that differ inside Docker network
+      POSTGRES_HOST: postgres
     depends_on:
-      redis:
-        condition: service_healthy
       postgres:
         condition: service_healthy
     networks:
@@ -101,7 +73,6 @@ services:
     restart: unless-stopped
 
 volumes:
-  redis-data:
   postgres-data:
   caddy-data:
   caddy-config:

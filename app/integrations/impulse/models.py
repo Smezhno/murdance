@@ -110,15 +110,75 @@ class Client(BaseModel):
 
 
 class Reservation(BaseModel):
-    """Reservation/booking model (CONTRACT §5). Matches Impulse CRM /reservation structure."""
+    """Reservation/booking model (CONTRACT §5). Matches Impulse CRM /reservation structure.
+
+    CRM returns nested objects: client.id, schedule.id, schedule.minutesBegin, etc.
+    date is a Unix timestamp (int).
+    """
 
     model_config = {"extra": "ignore"}
 
     id: int = Field(..., description="Reservation ID")
     client: dict[str, Any] | None = Field(None, description="Client object")
     schedule: dict[str, Any] | None = Field(None, description="Schedule object")
-    date: str | None = Field(None, description="Reservation date")
-    notes: str | None = Field(None, description="Notes")
+    date: int | str | None = Field(None, description="Reservation date (Unix timestamp)")
+    deleted: Any | None = Field(None, description="Soft-delete flag")
+    archived: Any | None = Field(None, description="Archive flag")
+
+    @property
+    def client_id(self) -> int | None:
+        """Client ID from nested client object."""
+        try:
+            return self.client.get("id") if self.client else None  # type: ignore[union-attr]
+        except (TypeError, AttributeError):
+            return None
+
+    @property
+    def schedule_id(self) -> int | None:
+        """Schedule ID from nested schedule object."""
+        try:
+            return self.schedule.get("id") if self.schedule else None  # type: ignore[union-attr]
+        except (TypeError, AttributeError):
+            return None
+
+    @property
+    def date_as_date(self) -> "date_type | None":
+        """Reservation date as Python date (converts Unix timestamp)."""
+        from datetime import date as date_type, timezone
+        if self.date is None:
+            return None
+        try:
+            if isinstance(self.date, int):
+                from datetime import datetime
+                return datetime.fromtimestamp(self.date, tz=timezone.utc).date()
+            return date_type.fromisoformat(str(self.date))
+        except (ValueError, OSError):
+            return None
+
+    @property
+    def group_name(self) -> str:
+        """Dance style name from schedule.group.style.name."""
+        try:
+            return self.schedule["group"]["style"]["name"]  # type: ignore[index]
+        except (TypeError, KeyError):
+            return "Направление не указано"
+
+    @property
+    def time_str(self) -> str:
+        """Start time as HH:MM from schedule.minutesBegin."""
+        try:
+            mb = self.schedule.get("minutesBegin") if self.schedule else None  # type: ignore[union-attr]
+            if mb is not None:
+                h, m = divmod(int(mb), 60)
+                return f"{h:02d}:{m:02d}"
+        except (TypeError, AttributeError, ValueError):
+            pass
+        return "?"
+
+    @property
+    def is_active(self) -> bool:
+        """True if reservation is not deleted or archived."""
+        return not self.deleted and not self.archived
 
 
 class Teacher(BaseModel):

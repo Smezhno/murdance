@@ -77,6 +77,17 @@ class TemporalParser:
             result.confidence = time_confidence if time_confidence != "low" else "medium"
             return result
 
+        # Try approximate time range
+        time_from, time_to, range_confidence = self._parse_time_range(text_lower)
+        if time_from:
+            return TemporalResult(
+                resolved_date=now.date(),
+                time=time_from,
+                confidence=range_confidence,
+                ambiguous=True,
+                raw_input=text,
+            )
+
         return TemporalResult(raw_input=text, error="Не удалось распознать дату или время")
 
     def _parse_date(self, text: str, now: datetime) -> TemporalResult:
@@ -318,6 +329,35 @@ class TemporalParser:
             return "14:00", "low"
 
         return None, "low"
+
+    def _parse_time_range(self, text: str) -> tuple[str | None, str | None, str]:
+        """Parse approximate time ranges from Russian text.
+
+        Returns:
+            Tuple of (time_from, time_to, confidence)
+            e.g. ("17:00", "22:00", "medium") for "вечером"
+        """
+        text_lower = text.lower().strip()
+
+        # "после 18:00" / "после 6 вечера"
+        after_match = re.search(r"после\s+(\d{1,2})(?:[:\.](\d{2}))?\s*(?:вечера|утра|дня)?", text_lower)
+        if after_match:
+            hour = int(after_match.group(1))
+            if re.search(r"вечера", text_lower) and hour < 12:
+                hour += 12
+            time_from = f"{hour:02d}:00"
+            return time_from, "23:00", "medium"
+
+        if re.search(r"\bво\s+второй\s+половине\s+дня\b", text_lower):
+            return "14:00", "20:00", "medium"
+        if re.search(r"\bутром\b", text_lower):
+            return "08:00", "12:00", "medium"
+        if re.search(r"\bдн[её]м\b", text_lower):
+            return "12:00", "17:00", "medium"
+        if re.search(r"\bвечером\b", text_lower):
+            return "17:00", "22:00", "medium"
+
+        return None, None, "low"
 
 
 def get_temporal_parser(timezone: str | None = None) -> TemporalParser:

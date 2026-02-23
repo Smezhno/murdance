@@ -15,15 +15,13 @@
 
 - **FastAPI** — основной веб-сервер для обработки webhook'ов
 - **Worker** — фоновый процесс для отправки сообщений и напоминаний
-- **Redis** — очереди, кэш, сессии
-- **PostgreSQL** — логирование и аудит
+- **PostgreSQL** — единственное хранилище: сессии, очереди, кэш, аудит (RFC-002)
 - **Caddy** — HTTPS прокси
 
 ## Требования
 
 - Python 3.11+
 - Docker и Docker Compose
-- Redis 5.0+
 - PostgreSQL 14+
 
 ## Быстрый старт
@@ -46,7 +44,6 @@ cp .env.example .env
 - `TELEGRAM_SECRET_TOKEN` — секретный токен для верификации webhook
 - `ADMIN_TELEGRAM_CHAT_ID` — ID чата администратора
 - `POSTGRES_PASSWORD` — пароль PostgreSQL
-- `REDIS_PASSWORD` — пароль Redis
 - `YANDEXGPT_API_KEY` — API ключ YandexGPT
 - `YANDEXGPT_FOLDER_ID` — ID папки Yandex Cloud
 - `CRM_TENANT` — имя тенанта Impulse CRM
@@ -61,7 +58,6 @@ docker compose up -d
 Это запустит все сервисы:
 - `app` — FastAPI приложение (порт 8000)
 - `worker` — фоновый процесс
-- `redis` — Redis сервер
 - `postgres` — PostgreSQL база данных
 - `caddy` — HTTPS прокси (порт 443)
 
@@ -75,9 +71,9 @@ curl http://localhost:8000/health
 ```json
 {
   "status": "healthy",
-  "redis": "healthy",
   "postgres": "healthy",
-  "crm": "healthy"
+  "crm": "healthy",
+  "pool": {}
 }
 ```
 
@@ -91,9 +87,9 @@ pip install -e .
 
 ### Запуск локально (без Docker)
 
-1. Запустите Redis и PostgreSQL локально или через Docker:
+1. Запустите PostgreSQL локально или через Docker:
 ```bash
-docker compose up redis postgres -d
+docker compose up postgres -d
 ```
 
 2. Создайте `.env` файл с настройками
@@ -113,7 +109,7 @@ murdance/
 │   ├── core/              # FSM, booking flow, intent resolution
 │   ├── integrations/      # Интеграции (Impulse CRM)
 │   ├── knowledge/         # База знаний студии
-│   ├── storage/           # Redis и PostgreSQL клиенты
+│   ├── storage/           # PostgreSQL клиент, миграции, session store
 │   ├── config.py          # Конфигурация
 │   ├── models.py          # Pydantic модели
 │   └── main.py            # FastAPI приложение
@@ -135,7 +131,7 @@ murdance/
 Webhook для получения сообщений от Telegram.
 
 ### `GET /health`
-Проверка состояния сервисов. Возвращает статус Redis, PostgreSQL и CRM.
+Проверка состояния сервисов. Возвращает статус PostgreSQL, CRM и пул соединений.
 
 ### `POST /debug` (только в TEST_MODE)
 Отладочный endpoint для тестирования booking flow.
@@ -164,12 +160,12 @@ python -m tests.prompt_regression.runner
 - **Telegram**: токен бота, секретный токен, ID админа
 - **CRM**: тенант и API ключ Impulse CRM
 - **LLM**: API ключ и folder ID YandexGPT
-- **База данных**: параметры подключения к PostgreSQL и Redis
+- **База данных**: параметры подключения к PostgreSQL
 - **Budget Guard**: лимиты токенов, стоимости, запросов
 
 ## Особенности
 
-- **Idempotency**: защита от дублирования записей через Redis SETNX
+- **Idempotency**: защита от дублирования записей через PostgreSQL INSERT ON CONFLICT
 - **Fallback queue**: автоматическая очередь при ошибках CRM
 - **Circuit breaker**: защита от каскадных сбоев внешних сервисов
 - **Budget Guard**: автоматическое отключение LLM при превышении лимитов

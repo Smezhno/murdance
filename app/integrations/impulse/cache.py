@@ -1,68 +1,84 @@
-"""Redis cache for Impulse CRM data.
+"""PostgreSQL cache for Impulse CRM data.
 
-Per CONTRACT §5: schedule 15min, groups 1h, teachers 1h.
+Replaces Redis SET/GET/SCAN with the crm_cache table.
+
+Per CONTRACT §5:  schedule TTL 15min, groups/teachers TTL 1h.
+Per RFC-002 §3.2.5: INSERT ... ON CONFLICT DO UPDATE (upsert), expires_at column.
+Per CONTRACT §4:  crm_cache is the source of truth for cached CRM data.
+
+Schema (migrations/001_redis_to_postgres.sql):
+    crm_cache (cache_key TEXT PRIMARY KEY, payload JSONB, expires_at TIMESTAMPTZ, ...)
 """
 
-import json
+import logging
 from functools import lru_cache
 from typing import Any
 
-from app.storage.redis import redis_storage
+from app.storage.postgres import postgres_storage as db
+
+logger = logging.getLogger(__name__)
 
 
 class ImpulseCache:
-    """Redis cache for Impulse CRM entities (CONTRACT §5)."""
+    """PostgreSQL-backed cache for Impulse CRM entities (CONTRACT §5).
 
-    # TTL in seconds
-    SCHEDULE_TTL = 15 * 60  # 15 minutes
-    GROUPS_TTL = 60 * 60  # 1 hour
-    TEACHERS_TTL = 60 * 60  # 1 hour
+    Public API is identical to the Redis version so adapter.py needs no changes:
+        cache.get(entity, *key_parts) → list | dict | None
+        cache.set(entity, value, *key_parts) → None
+        cache.delete(entity, *key_parts) → None
+        cache.clear_entity(entity) → None
+    """
+
+    # TTL in seconds (CONTRACT §5, RFC §20.3)
+    SCHEDULE_TTL = 15 * 60   # 15 minutes
+    GROUPS_TTL   = 60 * 60   # 1 hour
+    TEACHERS_TTL = 60 * 60   # 1 hour
 
     def _get_key(self, entity: str, *args: str | int) -> str:
-        """Get Redis cache key.
+        """Build a cache_key string from entity + optional qualifiers.
 
-        Args:
-            entity: Entity name
-            *args: Additional key parts
-
-        Returns:
-            Redis key string
+        Format mirrors the old Redis key: "impulse:cache:{entity}[:{arg}...]"
+        Kept identical so existing key patterns remain valid.
         """
         parts = [f"impulse:cache:{entity}"]
-        parts.extend(str(arg) for arg in args)
+        parts.extend(str(a) for a in args)
         return ":".join(parts)
 
     def _get_ttl(self, entity: str) -> int:
-        """Get TTL for entity.
-
-        Args:
-            entity: Entity name
-
-        Returns:
-            TTL in seconds
-        """
+        """Return TTL in seconds for a given entity type."""
         ttl_map = {
-            "schedule": self.SCHEDULE_TTL,
-            "group": self.GROUPS_TTL,
-            "groups": self.GROUPS_TTL,
-            "teacher": self.TEACHERS_TTL,
-            "teachers": self.TEACHERS_TTL,
+            "schedule":  self.SCHEDULE_TTL,
+            "group":     self.GROUPS_TTL,
+            "groups":    self.GROUPS_TTL,
+            "teacher":   self.TEACHERS_TTL,
+            "teachers":  self.TEACHERS_TTL,
         }
-        return ttl_map.get(entity, 60 * 60)  # Default 1 hour
+        return ttl_map.get(entity, 60 * 60)  # default 1 hour
 
-    async def get(self, entity: str, *key_parts: str | int) -> list[dict[str, Any]] | dict[str, Any] | None:
-        """Get cached data.
+    # ------------------------------------------------------------------
+    # Core cache operations
+    # ------------------------------------------------------------------
 
-        Args:
-            entity: Entity name
-            *key_parts: Additional key parts
+    async def get(
+        self,
+        entity: str,
+        *key_parts: str | int,
+    ) -> list[dict[str, Any]] | dict[str, Any] | None:
+        """Return cached payload, or None if missing / expired.
 
-        Returns:
-            Cached data or None
+        RFC-002 §3.2.5: SELECT WHERE cache_key = $1 AND expires_at > now()
+        The JSONB codec on the pool deserializes payload automatically.
         """
         key = self._get_key(entity, *key_parts)
-        data = await redis_storage.get_json(key)
-        return data
+        row = await db.fetchrow(
+            """
+            SELECT payload FROM crm_cache
+            WHERE cache_key = $1
+              AND expires_at > NOW()
+            """,
+            key,
+        )
+        return row["payload"] if row else None
 
     async def set(
         self,
@@ -70,43 +86,100 @@ class ImpulseCache:
         value: list[dict[str, Any]] | dict[str, Any],
         *key_parts: str | int,
     ) -> None:
-        """Set cached data.
+        """Upsert payload into crm_cache with a computed expires_at.
 
-        Args:
-            entity: Entity name
-            value: Data to cache
-            *key_parts: Additional key parts
+        RFC-002 §3.2.5: INSERT ... ON CONFLICT DO UPDATE.
+        make_interval(secs => $3) converts the integer TTL to a PG interval.
+        The JSONB codec serializes the dict/list automatically.
         """
         key = self._get_key(entity, *key_parts)
         ttl = self._get_ttl(entity)
-        await redis_storage.set_json(key, value, ex=ttl)
+        await db.execute(
+            """
+            INSERT INTO crm_cache (cache_key, payload, expires_at)
+            VALUES ($1, $2, NOW() + make_interval(secs => $3))
+            ON CONFLICT (cache_key) DO UPDATE SET
+                payload    = EXCLUDED.payload,
+                expires_at = EXCLUDED.expires_at,
+                updated_at = NOW()
+            """,
+            key, value, ttl,
+        )
 
     async def delete(self, entity: str, *key_parts: str | int) -> None:
-        """Delete cached data.
-
-        Args:
-            entity: Entity name
-            *key_parts: Additional key parts
-        """
+        """Hard-delete a single cache entry by exact key."""
         key = self._get_key(entity, *key_parts)
-        await redis_storage.delete(key)
+        await cache_invalidate(key)
 
     async def clear_entity(self, entity: str) -> None:
-        """Clear all cache for entity (pattern delete + base key).
+        """Delete all cache entries whose key starts with the entity prefix.
 
-        Args:
-            entity: Entity name
+        Replaces Redis SCAN + bulk DELETE.
+        RFC-002: cache_invalidate_pattern uses LIKE prefix match.
         """
-        # Delete keys with suffix (e.g., impulse:cache:schedule:2026-02-13_None_None)
-        pattern = f"impulse:cache:{entity}:*"
-        await redis_storage.scan_delete(pattern)
-        # Also delete the base key without suffix (e.g., impulse:cache:groups)
-        base_key = f"impulse:cache:{entity}"
-        await redis_storage.delete(base_key)
+        prefix = f"impulse:cache:{entity}"
+        deleted = await cache_invalidate_pattern(prefix)
+        logger.debug("impulse_cache: cleared entity=%s rows_deleted=%d", entity, deleted)
+
+
+# ------------------------------------------------------------------
+# Low-level helpers (also importable by other modules if needed)
+# ------------------------------------------------------------------
+
+async def cache_get(key: str) -> dict | list | None:
+    """Return payload for an exact cache_key, or None if missing/expired."""
+    row = await db.fetchrow(
+        """
+        SELECT payload FROM crm_cache
+        WHERE cache_key = $1
+          AND expires_at > NOW()
+        """,
+        key,
+    )
+    return row["payload"] if row else None
+
+
+async def cache_set(key: str, value: dict | list, ttl_seconds: int) -> None:
+    """Upsert a cache entry with an explicit TTL (in seconds)."""
+    await db.execute(
+        """
+        INSERT INTO crm_cache (cache_key, payload, expires_at)
+        VALUES ($1, $2, NOW() + make_interval(secs => $3))
+        ON CONFLICT (cache_key) DO UPDATE SET
+            payload    = EXCLUDED.payload,
+            expires_at = EXCLUDED.expires_at,
+            updated_at = NOW()
+        """,
+        key, value, ttl_seconds,
+    )
+
+
+async def cache_invalidate(key: str) -> None:
+    """Delete a single cache entry by exact key."""
+    await db.execute(
+        "DELETE FROM crm_cache WHERE cache_key = $1",
+        key,
+    )
+
+
+async def cache_invalidate_pattern(prefix: str) -> int:
+    """Delete all cache entries whose cache_key starts with prefix.
+
+    Replaces Redis SCAN + multi-key DELETE.
+    Returns the number of rows deleted.
+    """
+    result = await db.execute(
+        "DELETE FROM crm_cache WHERE cache_key LIKE $1 || '%'",
+        prefix,
+    )
+    # asyncpg returns 'DELETE N' — parse the count
+    try:
+        return int(result.split()[-1])
+    except (ValueError, IndexError, AttributeError):
+        return 0
 
 
 @lru_cache()
 def get_impulse_cache() -> ImpulseCache:
-    """Get Impulse cache instance (lazy init)."""
+    """Return the shared ImpulseCache instance (lazy, cached)."""
     return ImpulseCache()
-

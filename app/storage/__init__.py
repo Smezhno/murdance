@@ -1,1 +1,1 @@
-"""Storage abstractions for Redis and PostgreSQL."""
+"""Storage abstractions for PostgreSQL."""

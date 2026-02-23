@@ -8,6 +8,7 @@ RUN pip install --no-cache-dir .
 
 # Copy application code
 COPY app/ ./app/
+COPY worker/ ./worker/
 COPY knowledge/ ./knowledge/
 COPY tests/ ./tests/
 

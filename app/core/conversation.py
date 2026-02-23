@@ -1,110 +1,58 @@
 """Conversation session management.
 
-Per CONTRACT §4, §7: Session load/save from Redis, state transitions, timeout rules.
+Per CONTRACT §4, §7: Session load/save from PostgreSQL, state transitions, timeout rules.
+Per RFC-002 §3.2.1:   Redis GET/SET replaced by session_store.get_session/save_session.
 """
 
 from datetime import datetime, timedelta, timezone
+from uuid import UUID, uuid4
 
 from app.config import get_settings
-from app.core.fsm import can_transition, get_timeout_seconds, is_terminal_state
+from app.core.fsm import can_transition, get_timeout_seconds
 from app.models import ConversationState, Session, SlotValues
-from app.storage.redis import redis_storage
-
-
-def get_session_key(channel: str, chat_id: str) -> str:
-    """Get Redis key for session.
-
-    Args:
-        channel: Channel name
-        chat_id: Chat ID
-
-    Returns:
-        Redis key string
-    """
-    return f"session:{channel}:{chat_id}"
+from app.storage.session_store import (
+    delete_session,
+    get_session,
+    get_sessions_by_state,
+    save_session,
+)
 
 
 async def load_session(channel: str, chat_id: str) -> Session | None:
-    """Load session from Redis (CONTRACT §4).
+    """Load session from Postgres (CONTRACT §4).
 
-    Args:
-        channel: Channel name
-        chat_id: Chat ID
-
-    Returns:
-        Session if found, None otherwise
+    Returns None if not found or expired (session_store handles both cases).
     """
-    key = get_session_key(channel, chat_id)
-    data = await redis_storage.get_json(key)
-
-    if data is None:
-        return None
-
-    try:
-        # Pydantic v2 handles datetime/enum/nested model conversion automatically
-        return Session.model_validate(data)
-    except Exception:
-        # Invalid session data, return None
-        return None
+    return await get_session(channel, chat_id)
 
 
-async def save_session(session: Session) -> None:
-    """Save session to Redis with TTL (CONTRACT §4, §7).
+async def save_session_to_store(session: Session) -> None:
+    """Persist session to Postgres with correct expires_at (CONTRACT §4, §7).
 
-    Args:
-        session: Session to save
+    Calculates expires_at from the state-specific TTL (or default 24h),
+    stamps updated_at, then delegates to session_store.save_session().
     """
     settings = get_settings()
-    key = get_session_key(session.channel, session.chat_id)
 
-    # Update timestamps
-    session.update()
+    session.update()  # stamps updated_at = now()
 
-    # Calculate TTL based on state
-    ttl_seconds: int | None = None
-
-    # Check state-specific timeout
     state_timeout = get_timeout_seconds(session.state)
-    if state_timeout:
-        ttl_seconds = state_timeout
-    else:
-        # Default: session TTL from config (24h)
-        ttl_seconds = settings.session_ttl_hours * 3600
-
-    # Calculate expires_at
+    ttl_seconds = state_timeout if state_timeout else settings.session_ttl_hours * 3600
     session.expires_at = datetime.now(timezone.utc) + timedelta(seconds=ttl_seconds)
 
-    # Convert to dict for JSON serialization
-    session_dict = session.model_dump(mode="json")
-
-    # Save to Redis
-    await redis_storage.set_json(key, session_dict, ex=ttl_seconds)
+    await save_session(session)
 
 
 async def create_session(
-    trace_id: str | None,
+    trace_id: str | UUID | None,
     channel: str,
     chat_id: str,
     initial_state: ConversationState = ConversationState.IDLE,
 ) -> Session:
-    """Create new session.
-
-    Args:
-        trace_id: Trace ID (UUID string, optional - will generate if None)
-        channel: Channel name
-        chat_id: Chat ID
-        initial_state: Initial FSM state
-
-    Returns:
-        New Session instance
-    """
-    from uuid import UUID, uuid4
-
+    """Create new session and persist it."""
     settings = get_settings()
     now = datetime.now(timezone.utc)
-    expires_at = now + timedelta(hours=settings.session_ttl_hours)
 
-    # Generate trace_id if not provided
     if trace_id is None:
         trace_id_uuid = uuid4()
     elif isinstance(trace_id, str):
@@ -120,10 +68,10 @@ async def create_session(
         slots=SlotValues(),
         created_at=now,
         updated_at=now,
-        expires_at=expires_at,
+        expires_at=now + timedelta(hours=settings.session_ttl_hours),
     )
 
-    await save_session(session)
+    await save_session_to_store(session)
     return session
 
 
@@ -133,51 +81,34 @@ async def transition_state(
 ) -> bool:
     """Transition session to new state (CONTRACT §7).
 
-    Args:
-        session: Current session
-        new_state: Target state
-
-    Returns:
-        True if transition successful, False if not allowed
+    Returns True if transition was allowed and persisted, False otherwise.
     """
     if not can_transition(session.state, new_state):
         return False
 
     session.state = new_state
-    await save_session(session)
+    await save_session_to_store(session)
     return True
 
 
-async def update_slots(session: Session, **slot_updates: str | datetime | list | None) -> None:
-    """Update slot values in session.
-
-    Args:
-        session: Session to update
-        **slot_updates: Slot field updates (group, datetime_raw, datetime_resolved, messages, etc.)
-    """
+async def update_slots(
+    session: Session,
+    **slot_updates: str | datetime | list | None,
+) -> None:
+    """Update slot values in session and persist."""
     for key, value in slot_updates.items():
         if hasattr(session.slots, key):
             setattr(session.slots, key, value)
-
-    await save_session(session)
+    await save_session_to_store(session)
 
 
 async def check_timeout(session: Session) -> bool:
-    """Check if session has timed out (CONTRACT §7).
-
-    Args:
-        session: Session to check
-
-    Returns:
-        True if timed out, False otherwise
-    """
+    """Return True if the session has exceeded its TTL (CONTRACT §7)."""
     now = datetime.now(timezone.utc)
 
-    # Check expires_at
     if session.expires_at < now:
         return True
 
-    # Check state-specific timeout
     state_timeout = get_timeout_seconds(session.state)
     if state_timeout:
         elapsed = (now - session.updated_at).total_seconds()
@@ -188,45 +119,82 @@ async def check_timeout(session: Session) -> bool:
 
 
 async def reset_session(session: Session) -> None:
-    """Reset session to IDLE state (CONTRACT §7).
-
-    Args:
-        session: Session to reset
-    """
+    """Reset session to IDLE, clearing all slots (CONTRACT §7)."""
     session.state = ConversationState.IDLE
     session.slots = SlotValues()
-    await save_session(session)
+    await save_session_to_store(session)
 
 
 async def get_or_create_session(
-    trace_id: str | None,
+    trace_id: str | UUID | None,
     channel: str,
     chat_id: str,
 ) -> Session:
-    """Get existing session or create new one.
+    """Return existing valid session, or create a fresh one.
 
-    Args:
-        trace_id: Trace ID (UUID string, optional - will generate if None)
-        channel: Channel name
-        chat_id: Chat ID
-
-    Returns:
-        Session instance
+    If the session is expired it is reset to IDLE before returning.
+    The new trace_id is applied after reset so it propagates through
+    the recovered session.
     """
     session = await load_session(channel, chat_id)
 
     if session is None:
         return await create_session(trace_id, channel, chat_id)
 
-    # Check timeout
     if await check_timeout(session):
-        # Reset expired session
         await reset_session(session)
-        # Update trace_id to new one
         if trace_id is not None:
-            from uuid import UUID
-
             session.trace_id = UUID(trace_id) if isinstance(trace_id, str) else trace_id
-            await save_session(session)
+            await save_session_to_store(session)
 
     return session
+
+
+async def remove_session(channel: str, chat_id: str) -> None:
+    """Hard-delete a session row (test teardown, explicit logout)."""
+    await delete_session(channel, chat_id)
+
+
+async def recover_stale_sessions() -> dict[str, int]:
+    """Run on startup: find and fix stuck/expired sessions (CONTRACT §20).
+
+    Returns counts of sessions handled per recovery category.
+    """
+    from app.storage.postgres import postgres_storage
+
+    stats = {"booking_rescued": 0, "expired_reset": 0, "admin_timeout": 0}
+
+    # 1. BOOKING_IN_PROGRESS > 1 min → reset to IDLE + notify
+    stuck = await get_sessions_by_state(ConversationState.BOOKING_IN_PROGRESS, older_than_minutes=1)
+    for session in stuck:
+        await reset_session(session)
+        stats["booking_rescued"] += 1
+
+    # 2. Any non-IDLE state > 24h → IDLE (bulk SQL — cheaper than loading each row)
+    result = await postgres_storage.execute(
+        """
+        UPDATE sessions SET
+            fsm_state  = $1,
+            slots      = '{}',
+            updated_at = NOW(),
+            expires_at = NOW() + INTERVAL '24 hours'
+        WHERE fsm_state != $1
+          AND updated_at < NOW() - INTERVAL '24 hours'
+        """,
+        ConversationState.IDLE.value,
+    )
+    # asyncpg returns 'UPDATE N' — parse the count
+    try:
+        stats["expired_reset"] = int(result.split()[-1])
+    except (ValueError, IndexError, AttributeError):
+        stats["expired_reset"] = 0
+
+    # 3. ADMIN_RESPONDING > 4h → IDLE + notify
+    admin_stuck = await get_sessions_by_state(
+        ConversationState.ADMIN_RESPONDING, older_than_minutes=240
+    )
+    for session in admin_stuck:
+        await reset_session(session)
+        stats["admin_timeout"] += 1
+
+    return stats

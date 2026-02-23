@@ -97,12 +97,16 @@ class SlotValues(BaseModel):
         default_factory=list,
         description="Conversation history (last 10 messages for LLM context)",
     )
+    cancel_bookings: list[dict] = Field(
+        default_factory=list,
+        description="Pending bookings list during CANCEL_FLOW (replaces Redis temp key)",
+    )
 
 
 class Session(BaseModel):
     """Conversation session model (CONTRACT §4, §7).
 
-    Stored in Redis with TTL 24h.
+    Stored in PostgreSQL sessions table with TTL per FSM state (default 24h).
     Contains FSM state and slot values.
     Note: Not using strict mode to allow chat_id coercion from int (Telegram sends int).
     """

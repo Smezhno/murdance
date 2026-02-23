@@ -18,17 +18,16 @@ Payments. Admin panel UI. Multi-tenant. Voice processing. Recommendation engine.
 
 ## 3. Architecture
 
-**Monolith + worker. 5 containers. Docker Compose.**
+**Monolith + worker. 4 containers: app, worker, postgres, caddy. Docker Compose.**
 
 ```
 app      → FastAPI: webhooks, FSM, LLM, CRM tools
 worker   → Outbound queue, reminders, retries, DLQ
-redis    → Sessions, locks, cache, queues, budget counters
-postgres → Message logs, audit, booking attempts, errors, LLM cost
+postgres → ALL data: sessions, cache, queues, budget, logs, audit
 caddy    → HTTPS reverse proxy, auto Let's Encrypt
 ```
 
-- `api ↔ worker` communicate via Redis lists
+- api ↔ worker communicate via PostgreSQL outbound_queue + LISTEN/NOTIFY
 - Target: Yandex Cloud VM, 2 vCPU / 4 GB / 40 GB SSD
 - Deploy: `docker compose up -d` — that's it
 
@@ -36,11 +35,10 @@ caddy    → HTTPS reverse proxy, auto Let's Encrypt
 
 | Data | Source of truth | Storage |
 |------|----------------|---------|
-| Schedule, bookings, clients | **CRM (Impulse)** | CRM API, cached in Redis |
-| Conversation state + slots | **Redis** | TTL 24h |
-| User profiles | **Redis** | TTL 90d |
-| Prices, FAQ, studio info | **KB file** | `knowledge/studio.yaml` |
-| Logs, metrics, audit | **Postgres** | Retention 90d |
+| Schedule, bookings, clients | **CRM (Impulse)** | CRM API, cached in PostgreSQL |
+| Conversation state + slots | PostgreSQL | sessions table, app checks updated_at |
+| User profiles | PostgreSQL | sessions.metadata |
+| Schedule, bookings, clients | CRM (Impulse) | CRM API, cached in PostgreSQL crm_cache |
 
 **Bot MUST NOT invent schedule, prices, or availability.**
 
@@ -95,14 +93,14 @@ HANDOFF_TO_ADMIN → ADMIN_RESPONDING → IDLE
 
 **UnifiedMessage** must have: channel, chat_id, message_id, timestamp, text, message_type, sender_phone.
 
-- **Dedup:** `SETNX seen:{channel}:{message_id}` TTL 5min. If exists → drop.
+- **Dedup:** PostgreSQL INSERT into seen_messages с UNIQUE constraint.
 - **Non-text** (voice/sticker/image): reply "I only understand text 😊" — do NOT pass to LLM.
 - **Edited message** (TG): treat as slot correction, don't reset FSM.
 - **Spam:** >5 msg / 10s from same chat → drop silently.
 
 ## 9. Outbound messages
 
-**ALL outgoing messages go through Redis queue → worker sends.**
+**ALL outgoing messages go through PostgreSQL outbound_queue → worker sends.**
 
 - Rate limit: TG 30/s, WA 80/s
 - Retry: 0s → 5s → 30s → DLQ (Postgres `dead_letter_messages`)
@@ -112,8 +110,7 @@ HANDOFF_TO_ADMIN → ADMIN_RESPONDING → IDLE
 ## 10. Idempotency
 
 ```
-fingerprint = sha256(phone + schedule_id)
-key = idempotency:{fingerprint}  TTL 10min
+fingerprint = sha256(phone + schedule_id), PostgreSQL INSERT with UNIQUE constraint, app checks created_at < 10min
 ```
 
 Lock set BEFORE CRM call. On duplicate: "You're already booked ✅". **One booking only, even under retries.**
@@ -208,13 +205,13 @@ Fallback: send via TG if client has TG session.
 - Webhook signature verification (TG secret_token, WA X-Hub-Signature-256)
 - Replay protection: timestamp window 5min + message_id dedup
 - Secrets in `.env` (dev) / Yandex Lockbox (prod)
-- Redis requirepass, Postgres password, network isolation
+- Postgres password, network isolation
 - HTTPS via Caddy
 - User messages in LLM `user` role only, never `system`
 
 ## 20. Session Recovery
 
-On startup: scan Redis sessions. BOOKING_IN_PROGRESS > 1min → fallback + notify client → IDLE. Any state > 24h → IDLE. ADMIN_RESPONDING > 4h → notify → IDLE.
+On startup: query PostgreSQL sessions table. BOOKING_IN_PROGRESS > 1min → fallback + notify client → IDLE. Any state > 24h → IDLE. ADMIN_RESPONDING > 4h → notify → IDLE.
 
 ## 21. Prompt Regression Tests
 
@@ -229,7 +226,7 @@ Run: `python -m tests.prompt_regression.runner`. Stability: temperature=0, 3 run
 POST /webhook/telegram
 POST /webhook/whatsapp
 GET  /webhook/whatsapp    (verification)
-GET  /health              {status, redis, crm}
+GET  /health {status, postgres, crm}
 ```
 
 ## 23. Acceptance Criteria
@@ -248,7 +245,7 @@ GET  /health              {status, redis, crm}
 
 ## 24. Tech constraints
 
-Python 3.11+, FastAPI, Redis, PostgreSQL, httpx, structlog, pydantic v2. No Kafka. No microservices. Clean, testable code.
+Python 3.11+, FastAPI, PostgreSQL, httpx, structlog, pydantic v2. No Kafka. No microservices. Clean, testable code.
 
 ## 25. Working style
 

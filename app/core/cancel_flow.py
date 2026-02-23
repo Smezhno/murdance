@@ -1,6 +1,10 @@
 """Cancel booking flow handler.
 
 Per CONTRACT §7: List future bookings → select → confirm → cancel.
+
+Cancel-flow bookings list is stored in session.slots metadata via update_slots()
+(key: cancel_bookings) instead of the former Redis temporary key.
+TTL is implicitly bounded by the session TTL (CANCEL_FLOW state = 24h).
 """
 
 import logging
@@ -12,14 +16,8 @@ from uuid import UUID
 from app.core.conversation import transition_state, update_slots
 from app.integrations.impulse import get_impulse_adapter
 from app.models import ConversationState, UnifiedMessage
-from app.storage.redis import redis_storage
 
 logger = logging.getLogger(__name__)
-
-
-def _get_cancel_flow_key(channel: str, chat_id: str) -> str:
-    """Get Redis key for cancel flow data."""
-    return f"cancel_flow:{channel}:{chat_id}"
 
 
 class CancelFlow:
@@ -62,48 +60,46 @@ class CancelFlow:
                 await transition_state(session, ConversationState.IDLE)
                 return "У вас нет предстоящих записей для отмены."
 
-            # Fetch schedule and groups ONCE (fix N+1)
-            schedules = await self.impulse.get_schedule(date_from=today)
-            groups = await self.impulse.get_groups()
-
-            # Build schedule lookup
-            schedule_map = {s.id: s for s in schedules}
-            group_map = {g.id: g for g in groups}
-
-            # Filter and enrich bookings (store as plain dicts for JSON serialization)
+            # Build booking list from nested data already present in Reservation objects
             future_bookings = []
             for booking in bookings:
-                schedule = schedule_map.get(booking.schedule_id)
-                if schedule:
-                    booking_date = date.fromisoformat(schedule.date)
-                    if booking_date >= today:
-                        group = group_map.get(schedule.group_id)
-                        # Store as plain dict (JSON-serializable)
-                        future_bookings.append({
-                            "reservation_id": booking.id,
-                            "group_name": group.name if group else "Неизвестно",
-                            "date": schedule.date,
-                            "time": schedule.time,
-                        })
+                booking_date = booking.date_as_date
+                if booking_date and booking_date >= today:
+                    future_bookings.append({
+                        "reservation_id": booking.id,
+                        "group_name": booking.group_name,
+                        "date": booking_date.isoformat(),
+                        "time": booking.time_str,
+                    })
 
             if not future_bookings:
                 await transition_state(session, ConversationState.IDLE)
                 return "У вас нет предстоящих записей для отмены."
 
-            # Store in Redis (TTL 10min)
-            key = _get_cancel_flow_key(session.channel, session.chat_id)
-            await redis_storage.set_json(key, future_bookings, ex=600)
+            # Store in session slots (persists until session TTL expires)
+            await update_slots(session, cancel_bookings=future_bookings)
 
-            # Format list
+            # Single booking — skip selection, go straight to confirmation
+            if len(future_bookings) == 1:
+                item = future_bookings[0]
+                await update_slots(session, selected_reservation_id=item["reservation_id"])
+                booking_date = date.fromisoformat(item["date"])
+                return (
+                    f"Точно отменяем?\n\n"
+                    f"{item['group_name']}, {booking_date.strftime('%d.%m.%Y')} в {item['time']}\n\n"
+                    f"Напиши «да» для подтверждения или «нет» для отмены."
+                )
+
+            # Multiple bookings — show list
             booking_list = []
             for idx, item in enumerate(future_bookings, 1):
                 booking_date = date.fromisoformat(item["date"])
                 booking_list.append(
-                    f"{idx}. {item['group_name']}, {booking_date.strftime('%d.%m.%Y')} {item['time']}"
+                    f"{idx}. {item['group_name']}, {booking_date.strftime('%d.%m.%Y')} в {item['time']}"
                 )
 
-            response = f"Ваши предстоящие записи:\n\n" + "\n".join(booking_list)
-            response += "\n\nНапишите номер записи для отмены (например, '1')."
+            response = "Какую запись отменить?\n\n" + "\n".join(booking_list)
+            response += "\n\nНапиши цифру или название занятия."
             return response
 
         except Exception as e:
@@ -125,57 +121,57 @@ class CancelFlow:
         # Check for abort
         text_lower = message.text.lower().strip()
         if text_lower in ("нет", "no", "отмена", "выход"):
-            key = _get_cancel_flow_key(session.channel, session.chat_id)
-            await redis_storage.delete(key)
+            await update_slots(session, cancel_bookings=[])
             await transition_state(session, ConversationState.IDLE)
             return "Хорошо. Чем ещё могу помочь?"
 
-        # Load bookings from Redis
-        key = _get_cancel_flow_key(session.channel, session.chat_id)
-        future_bookings = await redis_storage.get_json(key)
+        # Load bookings from session slots — if empty, restart the flow
+        future_bookings = session.slots.cancel_bookings
 
         if not future_bookings:
-            await transition_state(session, ConversationState.IDLE)
-            return "Список записей устарел. Начните заново."
+            return await self.start(session, trace_id)
 
-        # Parse selection
-        selected_num = None
+        # Parse selection — accept digit or partial name match
+        selected: dict | None = None
 
         try:
             if text_lower.isdigit():
-                selected_num = int(text_lower)
-            elif "отмена" in text_lower or "отменить" in text_lower:
-                words = text_lower.split()
-                for word in words:
-                    if word.isdigit():
-                        selected_num = int(word)
+                idx = int(text_lower) - 1
+                if 0 <= idx < len(future_bookings):
+                    selected = future_bookings[idx]
+            else:
+                # Match by group name substring
+                for item in future_bookings:
+                    if text_lower in item["group_name"].lower():
+                        selected = item
                         break
+                # Also try to extract digit from phrase like "первую" or "отменить 2"
+                if not selected:
+                    for word in text_lower.split():
+                        if word.isdigit():
+                            idx = int(word) - 1
+                            if 0 <= idx < len(future_bookings):
+                                selected = future_bookings[idx]
+                            break
         except (ValueError, AttributeError):
             pass
 
-        if selected_num is None or selected_num < 1:
-            return "Не понял номер записи. Пожалуйста, укажите номер (например, '1')."
-
-        if selected_num > len(future_bookings):
-            return f"Нет записи с номером {selected_num}. Выберите из списка."
-
-        # Get selected booking
-        selected = future_bookings[selected_num - 1]
-        reservation_id = selected["reservation_id"]
+        if selected is None:
+            booking_list = []
+            for idx, item in enumerate(future_bookings, 1):
+                booking_date = date.fromisoformat(item["date"])
+                booking_list.append(f"{idx}. {item['group_name']}, {booking_date.strftime('%d.%m.%Y')} в {item['time']}")
+            return "Не поняла, какую запись отменить. Напиши цифру:\n\n" + "\n".join(booking_list)
 
         # Store selected reservation ID
-        await update_slots(session, selected_reservation_id=reservation_id)
+        await update_slots(session, selected_reservation_id=selected["reservation_id"])
 
-        # Format confirmation (use plain dict fields)
         booking_date = date.fromisoformat(selected["date"])
-        confirmation = (
-            f"Отменить запись?\n\n"
-            f"Направление: {selected['group_name']}\n"
-            f"Дата: {booking_date.strftime('%d.%m.%Y')}\n"
-            f"Время: {selected['time']}\n\n"
-            f"Подтвердите отмену (да/нет)?"
+        return (
+            f"Точно отменяем?\n\n"
+            f"{selected['group_name']}, {booking_date.strftime('%d.%m.%Y')} в {selected['time']}\n\n"
+            f"Напиши «да» для подтверждения или «нет» для отмены."
         )
-        return confirmation
 
     async def confirm(self, session: Any, message: UnifiedMessage, trace_id: UUID) -> str:
         """Execute cancellation.
@@ -195,10 +191,7 @@ class CancelFlow:
         text_lower = message.text.lower()
         if text_lower not in ("да", "yes", "подтверждаю", "согласен"):
             if text_lower in ("нет", "no", "отмена"):
-                await update_slots(session, selected_reservation_id=None)
-                # Cleanup Redis key
-                key = _get_cancel_flow_key(session.channel, session.chat_id)
-                await redis_storage.delete(key)
+                await update_slots(session, selected_reservation_id=None, cancel_bookings=[])
                 await transition_state(session, ConversationState.IDLE)
                 return "Отмена записи отменена. Чем ещё могу помочь?"
             return "Пожалуйста, ответьте 'да' для подтверждения или 'нет' для отмены."
@@ -210,10 +203,8 @@ class CancelFlow:
                 trace_id=trace_id,
             )
 
-            # Cleanup
-            await update_slots(session, selected_reservation_id=None)
-            key = _get_cancel_flow_key(session.channel, session.chat_id)
-            await redis_storage.delete(key)
+            # Cleanup slots
+            await update_slots(session, selected_reservation_id=None, cancel_bookings=[])
 
             # Return to IDLE
             await transition_state(session, ConversationState.IDLE)

@@ -12,7 +12,8 @@ You write production Python code. You follow the contract strictly.
 ## Core Principles
 - If unclear or missing — **ASK**. Never invent business logic, CRM endpoints, or KB fields.
 - Bot MUST NOT invent schedule, prices, availability, or teacher opinions.
-- Every outbound message goes through Redis queue → worker sends. Never send directly from api.
+- PostgreSQL outbound_queue + LISTEN/NOTIFY is the queue. FOR UPDATE SKIP LOCKED for worker concurrency.
+- No Redis. All state in PostgreSQL. Do not import redis or use redis anywhere.
 - All conversations logged to Postgres with trace_id.
 
 ## Before Writing Code
@@ -24,15 +25,14 @@ You write production Python code. You follow the contract strictly.
 ## Tech Stack (fixed, do not change)
 - Python 3.11+
 - FastAPI + uvicorn
-- Redis (sessions, locks, cache, queues, budgets)
-- PostgreSQL (logs, audit, metrics, DLQ)
+- PostgreSQL (all data — sessions, cache, queues, budgets, logs)
 - httpx (async HTTP for CRM + messenger APIs)
 - structlog (structured logging)
 - pydantic v2 (all data models, strict validation)
-- Docker Compose (app + worker + redis + postgres + caddy)
+- Docker Compose (app + worker + postgres + caddy)
 
 ## Do NOT Use
-- Kafka, RabbitMQ, or any message broker (Redis lists are the queue)
+- Kafka, RabbitMQ, or any message broker
 - SQLAlchemy ORM (use raw asyncpg with pydantic models)
 - Microservice architecture
 - Frontend frameworks
@@ -50,11 +50,11 @@ You write production Python code. You follow the contract strictly.
 
 ## Architecture Rules
 - 2 processes: `app` (FastAPI) and `worker` (standalone Python process, same codebase)
-- Communication: app pushes to Redis list → worker consumes
+- Communication: Communication: app INSERTs into outbound_queue → NOTIFY → worker polls with FOR UPDATE SKIP LOCKED
 - CRM (Impulse): HTTP Basic auth, POST to /api/{entity}/{action}. See CONTRACT §5.
 - LLM: only for intent classification, slot extraction, message rewriting. Never for facts.
 - FSM: deterministic state machine with slot filling. See CONTRACT §7.
-- Idempotency: sha256(phone + schedule_id), Redis SETNX before CRM call. See CONTRACT §10.
+- Idempotency: sha256(phone + schedule_id), PostgreSQL UNIQUE constraint before CRM call. See CONTRACT §10.
 - Budget Guard: hard limits on tokens/cost, auto-switch to static KB. See CONTRACT §12.
 
 ## Testing
@@ -108,11 +108,10 @@ dancebot/
 │   │   └── impulse/
 │   │       ├── client.py    # httpx + Basic auth
 │   │       ├── models.py    # CRM response models
-│   │       ├── cache.py     # Redis cache with TTL
+│   │       ├── cache.py     # CRM cache with TTL (PostgreSQL)
 │   │       ├── fallback.py  # Fallback queue on CRM error
 │   │       └── error_handler.py
 │   └── storage/
-│       ├── redis.py         # Redis connection pool
 │       └── postgres.py      # asyncpg, table creation, queries
 ├── worker/
 │   ├── main.py              # Worker entrypoint

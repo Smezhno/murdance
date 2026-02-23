@@ -145,6 +145,7 @@ def build_schedule_groups(
             "days": sorted(days),
             "time_str": time_str,
             "minutes_begin": minutes_begin,
+            "style": getattr(s, "style_name", None) or "",
         })
     return result
 
@@ -153,22 +154,33 @@ def format_schedule(
     schedules: list,
     group_filter: str | None = None,
     message_text: str = "",
+    teacher_filter: str | None = None,
 ) -> str:
     """Format schedule as a numbered list grouped by teacher (deterministic, no LLM).
 
     Internally calls build_schedule_groups — output order matches parse_schedule_choice index.
+    teacher_filter: lowercase substring to filter by teacher name.
     """
     group_filter = _resolve_group_filter(schedules, group_filter, message_text)
     groups = build_schedule_groups(schedules, group_filter=group_filter)
 
+    if teacher_filter:
+        groups = [g for g in groups if teacher_filter in (g["teacher"] or "").lower()]
+
     if not groups:
         return "На ближайшие дни занятий не найдено. Уточните у администратора."
 
-    header = f"Расписание {group_filter}:" if group_filter else "Актуальное расписание:"
+    if teacher_filter:
+        # Show teacher name + style in header
+        teacher_name = groups[0]["teacher"] if groups else teacher_filter
+        header = f"Расписание {teacher_name}:"
+    else:
+        header = f"Расписание {group_filter}:" if group_filter else "Актуальное расписание:"
     lines = [header, ""]
     for idx, g in enumerate(groups, start=1):
         days_str = ", ".join(DAYS_RU[d] for d in g["days"] if 0 <= d <= 6)
-        lines.append(f"{idx}. {g['teacher']} — {days_str}, {g['time_str']}")
+        style_part = f" ({g.get('style', '')})" if teacher_filter and g.get("style") else ""
+        lines.append(f"{idx}. {g['teacher']}{style_part} — {days_str}, {g['time_str']}")
 
     return "\n".join(lines)
 

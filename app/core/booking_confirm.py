@@ -184,7 +184,7 @@ async def confirm_booking(
             success=success,
             group_id=session.slots.group,
             schedule_id=str(schedule_id) if schedule_id else None,
-            datetime=session.slots.datetime_resolved,
+            datetime_=session.slots.datetime_resolved,
             client_name=session.slots.client_name,
             client_phone=phone,
             error_message=None if success else "booking failed",
