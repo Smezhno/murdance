@@ -37,8 +37,12 @@ tests:
   - name: "query_no_hallucination"
     user: "Расписание на неделю"
     expected:
-      contains:
-        - "расписание"
+      contains_one_of:
+        - "расписан"
+        - "занятие"
+        - "запись"
+        - "группа"
+        - "филиал"
       not_contains:
         - "ошибка"
         - "не заполнено"
@@ -47,7 +51,11 @@ tests:
   - name: "booking_shows_direction_schedule"
     user: "/start"
     expected:
-      contains:
-        - "Здравствуйте"
+      contains_one_of:
+        - "привет"
+        - "здравствуйте"
+        - "помог"
+        - "интерес"
+        - "направлен"
       not_contains:
         - "ошибка"

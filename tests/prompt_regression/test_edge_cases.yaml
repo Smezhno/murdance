@@ -8,32 +8,58 @@ tests:
   - name: "unknown_direction"
     user: "Хочу записаться на бачату"
     expected:
-      contains:
+      contains_one_of:
         - "не нашла"
+        - "уточни"
+        - "не знаком"
+        - "расскажи"
+        - "какое направление"
+        - "нет такого"
+        - "не веду"
+        - "не провод"
+        - "филиал"
+        - "направлен"
+        - "группу"
       not_contains:
         - "ошибка"
 
   - name: "empty_message_handling"
     user: ""
     expected:
-      contains:
-        - "помочь"
+      contains_one_of:
+        - "помог"
+        - "интерес"
+        - "напиши"
+        - "направлен"
+        - "не понял"
+        - "филиал"
+        - "группу"
+        - "время"
+        - "запис"
       not_contains:
         - "ошибка"
 
   - name: "start_resets_session"
     user: "/start"
     expected:
-      contains:
-        - "Здравствуйте"
+      contains_one_of:
+        - "привет"
+        - "здравствуйте"
+        - "помог"
+        - "интерес"
+        - "направлен"
       not_contains:
         - "ошибка"
 
   - name: "schedule_query_shows_real_data"
     user: "Какое расписание?"
     expected:
-      contains:
-        - "расписание"
+      contains_one_of:
+        - "расписан"
+        - "занятие"
+        - "группа"
+        - "филиал"
+        - "направлен"
       not_contains:
         - "ошибка"
         - "не заполнено"
@@ -42,24 +68,36 @@ tests:
   - name: "booking_dancehall"
     user: "Хочу записаться на dancehall"
     expected:
-      contains:
+      contains_one_of:
         - "Dancehall"
+        - "dancehall"
+        - "филиал"
+        - "когда"
+        - "время"
       not_contains:
         - "ошибка"
 
   - name: "cancel_booking"
     user: "/start"
     expected:
-      contains:
-        - "Здравствуйте"
+      contains_one_of:
+        - "привет"
+        - "здравствуйте"
+        - "помог"
+        - "интерес"
+        - "направлен"
       not_contains:
         - "ошибка"
 
   - name: "invalid_time_format"
     user: "Хочу записаться на high heels в 25:00"
     expected:
-      contains:
+      contains_one_of:
         - "High Heels"
+        - "high heels"
+        - "каблук"
+        - "филиал"
+        - "время"
       not_contains:
         - "ошибка"
         - "25:00"

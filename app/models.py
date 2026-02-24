@@ -83,8 +83,13 @@ class ConversationState(str, Enum):
 
 
 class SlotValues(BaseModel):
-    """Slot values for booking flow (CONTRACT §7)."""
+    """Slot values for booking flow (CONTRACT §7, extended per RFC-003 §4.1).
 
+    All new fields have defaults — existing PostgreSQL JSONB sessions deserialize
+    without errors (backward-compatible extension).
+    """
+
+    # === Existing fields (unchanged) ===
     group: str | None = None
     teacher: str | None = None
     datetime_raw: str | None = None
@@ -101,6 +106,15 @@ class SlotValues(BaseModel):
         default_factory=list,
         description="Pending bookings list during CANCEL_FLOW (replaces Redis temp key)",
     )
+
+    # === New fields (RFC-003 §4.1) ===
+    branch: str | None = None
+    experience: str | None = None
+    schedule_shown: bool = False
+    summary_shown: bool = False
+    confirmed: bool = False
+    booking_created: bool = False
+    receipt_sent: bool = False
 
 
 class Session(BaseModel):

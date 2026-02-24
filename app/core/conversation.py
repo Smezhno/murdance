@@ -2,14 +2,29 @@
 
 Per CONTRACT §4, §7: Session load/save from PostgreSQL, state transitions, timeout rules.
 Per RFC-002 §3.2.1:   Redis GET/SET replaced by session_store.get_session/save_session.
+Per RFC-003:          FSM validation removed — ConversationEngine controls transitions via
+                      compute_phase(). get_timeout_seconds() inlined here; fsm.py deleted.
 """
 
 from datetime import datetime, timedelta, timezone
 from uuid import UUID, uuid4
 
 from app.config import get_settings
-from app.core.fsm import can_transition, get_timeout_seconds
 from app.models import ConversationState, Session, SlotValues
+
+
+def get_timeout_seconds(state: ConversationState) -> int | None:
+    """State-specific session TTL in seconds (CONTRACT §7).
+
+    Inlined from fsm.py after FSM deletion (RFC-003).
+    Returns None for states that use the default session TTL.
+    """
+    timeouts: dict[ConversationState, int] = {
+        ConversationState.CONFIRM_BOOKING: 3 * 3600,   # 3h → IDLE
+        ConversationState.BOOKING_IN_PROGRESS: 30,      # 30s → fallback
+        ConversationState.ADMIN_RESPONDING: 4 * 3600,   # 4h → IDLE
+    }
+    return timeouts.get(state)
 from app.storage.session_store import (
     delete_session,
     get_session,
@@ -79,13 +94,11 @@ async def transition_state(
     session: Session,
     new_state: ConversationState,
 ) -> bool:
-    """Transition session to new state (CONTRACT §7).
+    """Set session state and persist (RFC-003).
 
-    Returns True if transition was allowed and persisted, False otherwise.
+    Validation matrix removed — ConversationEngine controls transitions via
+    compute_phase(). Always returns True so callers need no change.
     """
-    if not can_transition(session.state, new_state):
-        return False
-
     session.state = new_state
     await save_session_to_store(session)
     return True

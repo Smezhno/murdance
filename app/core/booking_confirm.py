@@ -42,16 +42,13 @@ def generate_confirmation_summary(session: Any) -> str:
     )
 
 
-async def generate_receipt(
+def generate_receipt(
     reservation: Any,
     client: Any,
     session: Any,
     kb: Any,
 ) -> str:
-    """Generate booking receipt (CONTRACT §6: ≤300 chars structured block).
-
-    Appends an LLM-generated upsell/warm closing via generate_response("booking_done").
-    """
+    """Generate booking receipt (CONTRACT §6: ≤300 chars structured block)."""
     slots = session.slots
     group = slots.group or "не указано"
     if slots.datetime_resolved:
@@ -61,9 +58,18 @@ async def generate_receipt(
     else:
         datetime_str = "не указано"
 
-    studio_address = kb.studio.address
+    # Branch address: prefer branch-specific address, fall back to generic studio address
+    branch_address = (
+        kb.get_branch_address(slots.branch)
+        if getattr(slots, "branch", None)
+        else None
+    ) or kb.studio.address
+
+    # Dress code: append only when found
+    dress_code = kb.get_dress_code(slots.group) if getattr(slots, "group", None) else None
 
     reservation_line = f"\nНомер записи: {reservation.id}" if getattr(reservation, "id", None) else ""
+    dress_code_line = f"\nС собой: {dress_code}" if dress_code else ""
 
     receipt = (
         f"✅ Запись подтверждена!\n\n"
@@ -71,25 +77,16 @@ async def generate_receipt(
         f"Дата и время: {datetime_str}\n"
         f"Имя: {client.name}\n"
         f"Телефон: {client.phone_str}\n"
-        f"Адрес: {studio_address}"
+        f"Адрес: {branch_address}"
         f"{reservation_line}"
+        f"{dress_code_line}"
     )
 
-    # Truncate address if over 300 chars
+    # Truncate if over 300 chars
     if len(receipt) > 300:
-        excess = len(receipt) - 297
-        if len(studio_address) > excess + 3:
-            receipt = receipt.replace(studio_address, studio_address[: len(studio_address) - excess - 3] + "...")
-        else:
-            receipt = receipt[:297] + "..."
+        receipt = receipt[:297] + "..."
 
-    # LLM-generated warm closing / upsell
-    closing = await generate_response(
-        "booking_done",
-        {"group": group, "datetime": datetime_str},
-        session.trace_id,
-    )
-    return f"{receipt}\n\n{closing}"
+    return receipt
 
 
 async def confirm_booking(
@@ -167,7 +164,7 @@ async def confirm_booking(
         )
         success = True
         await transition_state(session, ConversationState.BOOKING_DONE)
-        return await generate_receipt(reservation, client, session, kb)
+        return generate_receipt(reservation, client, session, kb)
 
     except RuntimeError as e:
         return str(e)

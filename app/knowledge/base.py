@@ -4,11 +4,14 @@ Per CONTRACT §15: Load and validate studio.yaml against schema v1.0.
 Fail-fast on invalid schema (app must not start).
 """
 
+import logging
 import re
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
+
+logger = logging.getLogger(__name__)
 
 import pymorphy3
 import yaml
@@ -45,6 +48,26 @@ class Branch(BaseModel):
     address: str = Field(..., description="Branch address")
     phone: str = Field(..., description="Branch phone number(s)")
     halls: list[str] = Field(default_factory=list, description="Hall descriptions")
+
+
+class BookingBranch(BaseModel):
+    """Top-level branch entry for booking routing (RFC-003 §8.1).
+
+    Distinct from studio.branches (which carries phone/halls).
+    styles[] matches services[].id (hyphen-separated).
+    """
+
+    id: str = Field(..., description="Branch slug ID")
+    name: str = Field(..., description="Branch display name")
+    address: str = Field(..., description="Full address with navigation hint")
+    styles: list[str] = Field(..., description="Service IDs available at this branch")
+
+    @field_validator("styles")
+    @classmethod
+    def validate_styles_non_empty(cls, v: list[str]) -> list[str]:
+        if not v:
+            raise ValueError("Branch styles must be a non-empty list")
+        return v
 
 
 class StudioInfo(BaseModel):
@@ -216,6 +239,24 @@ class KnowledgeBase(BaseModel):
     escalation: Escalation = Field(..., description="Escalation configuration")
     additional: dict[str, str] | None = Field(default=None, description="Additional info (promotions, tips, etc.)")
 
+    # === RFC-003 §8.1 extensions ===
+    branches: list[BookingBranch] = Field(
+        default_factory=list,
+        description="Booking branches with style routing (RFC-003 §8.1)",
+    )
+    style_recommendations: dict[str, list[str]] = Field(
+        default_factory=dict,
+        description="Style suggestions by preference category (RFC-003 §8.1)",
+    )
+    dress_code: dict[str, str] = Field(
+        default_factory=dict,
+        description="Dress code per service ID (RFC-003 §8.1)",
+    )
+    promotions: list[dict] = Field(
+        default_factory=list,
+        description="Active promotions (RFC-003 OQ-V2-3)",
+    )
+
     @field_validator("schema_version")
     @classmethod
     def validate_schema_version(cls, v: str) -> str:
@@ -239,6 +280,80 @@ class KnowledgeBase(BaseModel):
         if not v:
             raise ValueError("At least one teacher must be defined")
         return v
+
+    @field_validator("branches")
+    @classmethod
+    def validate_branches(cls, v: list[BookingBranch]) -> list[BookingBranch]:
+        """When branches section is present and non-empty, require at least 1 branch.
+
+        Empty list (section absent in YAML) passes — backward-compatible.
+        Individual branch style validation is handled by BookingBranch itself.
+        """
+        return v
+
+    @field_validator("dress_code")
+    @classmethod
+    def validate_dress_code(cls, v: dict[str, str]) -> dict[str, str]:
+        """When dress_code section is present and non-empty, all values must be strings.
+
+        Empty dict (section absent in YAML) passes — backward-compatible.
+        """
+        if v:
+            for key, val in v.items():
+                if not isinstance(val, str) or not val.strip():
+                    raise ValueError(f"dress_code[{key!r}] must be a non-empty string")
+        return v
+
+    @field_validator("style_recommendations")
+    @classmethod
+    def validate_style_recommendations(cls, v: dict[str, list[str]]) -> dict[str, list[str]]:
+        """When style_recommendations is present and non-empty, each category must be a non-empty list.
+
+        Empty dict (section absent in YAML) passes — backward-compatible.
+        """
+        if v:
+            for key, styles in v.items():
+                if not styles:
+                    raise ValueError(f"style_recommendations[{key!r}] must be a non-empty list")
+        return v
+
+    def get_branch(self, name_or_id: str) -> BookingBranch | None:
+        """Get booking branch by exact id or exact case-insensitive name match."""
+        target = name_or_id.strip()
+        for branch in self.branches:
+            if branch.id == target:
+                return branch
+        target_lower = target.lower()
+        for branch in self.branches:
+            if branch.name.lower() == target_lower:
+                return branch
+        return None
+
+    def get_dress_code(self, style: str) -> str | None:
+        """Get dress code for a service style.
+
+        Lookup order:
+        1. Direct key match after hyphen/underscore normalization (e.g. "high_heels" → "high-heels").
+        2. Resolve via service aliases — handles CRM display names like "High Heels", "Girly Hip-Hop".
+        Canonical keys in dress_code are hyphen-separated (matching services[].id).
+        """
+        normalized = style.strip().replace("_", "-").lower()
+        result = self.dress_code.get(normalized)
+        if result:
+            return result
+        service = self.resolve_service(style)
+        if service:
+            return self.dress_code.get(service.id)
+        return None
+
+    def get_branch_address(self, branch_name: str) -> str | None:
+        """Get branch address by name or id. Returns None if not found."""
+        branch = self.get_branch(branch_name)
+        return branch.address if branch else None
+
+    def get_active_promotions(self) -> list[dict]:
+        """Return all promotions (active/inactive flag not yet implemented — RFC-003 OQ-V2-3)."""
+        return list(self.promotions)
 
     def search_faq(self, query: str) -> list[FAQ]:
         """Search FAQ entries by question text (case-insensitive).
@@ -449,8 +564,7 @@ class KnowledgeBase(BaseModel):
         lines.append("\nНаправления:")
         for service in self.services:
             price_info = f"{service.price_single}₽" if service.price_single else "цена уточняется"
-            aliases_part = f" | Также: {', '.join(service.aliases)}" if service.aliases else ""
-            lines.append(f"- {service.name} ({service.id}){aliases_part}: {service.description}. Разовое занятие: {price_info}")
+            lines.append(f"- {service.name} ({service.id}): {service.description}. Разовое: {price_info}")
 
         lines.append("\nПреподаватели:")
         for teacher in self.teachers:
@@ -527,6 +641,13 @@ def load_knowledge_base(path: str | None = None) -> KnowledgeBase:
         _kb = KnowledgeBase(**data)
     except Exception as e:
         raise ValueError(f"Invalid knowledge base schema in {kb_path}: {e}") from e
+
+    if _kb.studio.booking_branch:
+        logger.warning(
+            "⚠️  KB loaded: booking restricted to branch '%s'. "
+            "Set studio.booking_branch=null for all branches.",
+            _kb.studio.booking_branch,
+        )
 
     return _kb
 

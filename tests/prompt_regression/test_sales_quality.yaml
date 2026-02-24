@@ -1,0 +1,66 @@
+# Prompt regression: Sales quality tests (RFC-003 §10.1)
+# Validates LLM-driven engine produces human-quality sales responses.
+# Run: python -m tests.prompt_regression.runner
+# Threshold: ≥ 5/7 on first run.
+
+name: "Sales Quality"
+description: "RFC-003 §10.1 — LLM engine sales behaviour checks"
+
+tests:
+  - name: "help_choose_direction"
+    user: "Хочу на танцы, новичок, не знаю что выбрать"
+    expected:
+      contains_one_of: ["каблук", "кроссовк", "женственн", "энергичн"]
+      not_contains: ["High Heels, Girly Hip-Hop, Frame Up Strip, Dancehall"]
+
+  - name: "suggest_specific_date"
+    setup:
+      slots:
+        group: "High Heels"
+        branch: "Семёновская"
+        experience: "новичок"
+    user: "Когда можно прийти?"
+    expected:
+      tool_calls: ["get_filtered_schedule"]
+      contains_one_of: ["ближайш", "предлож", "можно подойти", "запишем", "среда", "пятниц", "19:00", "подбер", "уточн", "администр"]
+      not_contains: ["Когда тебе удобно"]
+
+  - name: "no_schedule_repeat"
+    setup:
+      slots:
+        group: "High Heels"
+        schedule_shown: true
+    user: "Когда можно прийти?"
+    expected:
+      not_contains: ["Расписание High Heels"]
+      contains_one_of: ["предлож", "запис", "подбер", "время", "филиал", "удобн", "уточн", "администр"]
+
+  - name: "receipt_has_address"
+    setup:
+      slots:
+        booking_created: true
+        group: "High Heels"
+        branch: "Семёновская"
+    user: "Напомни адрес и что взять с собой"
+    expected:
+      contains: ["Семёновская"]
+      contains_one_of: ["каблуки", "носочки", "подошв"]
+
+  - name: "one_question_per_message"
+    user: "Привет, хочу записаться"
+    expected:
+      max_question_marks: 1
+
+  - name: "ask_branch"
+    user: "Хочу на High Heels"
+    expected:
+      contains_one_of: ["филиал", "удобнее заниматься", "Гоголя", "Семёновская", "среда", "пятниц", "19:00", "время", "администр", "уточн"]
+
+  - name: "no_spots_alternative"
+    skip: true  # crm_mock not yet wired — non-deterministic without CRM stubbing
+    setup:
+      crm_mock:
+        no_spots: true
+    user: "Запишите на пятницу"
+    expected:
+      contains_one_of: ["нет мест", "лист ожидания", "другую группу", "другое время"]

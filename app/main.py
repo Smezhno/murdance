@@ -98,11 +98,11 @@ async def telegram_webhook(request: Request) -> Response:
         # would be stale by the time the worker processes it from the queue.
         await telegram_channel.send_typing(message.chat_id)
 
-        # Process message through booking flow (CONTRACT §6, §7, §11)
-        from app.core.booking_flow import get_booking_flow
+        # Process message through conversation engine (RFC-003)
+        from app.core.engine import get_conversation_engine
 
-        booking_flow = get_booking_flow()
-        response_text = await booking_flow.process_message(message, message.trace_id)
+        engine = get_conversation_engine()
+        response_text = await engine.handle_message(message, message.trace_id)
 
         # Enqueue response via outbound_queue (CONTRACT §9)
         queue_id = await enqueue_message(
@@ -209,11 +209,11 @@ async def debug_command(request: Request) -> JSONResponse:
         # Parse webhook
         message = await telegram_channel.parse_webhook(request)
 
-        # Process through booking flow
-        from app.core.booking_flow import get_booking_flow
+        # Process through conversation engine (RFC-003)
+        from app.core.engine import get_conversation_engine
 
-        booking_flow = get_booking_flow()
-        response_text = await booking_flow.process_message(message, message.trace_id)
+        engine = get_conversation_engine()
+        response_text = await engine.handle_message(message, message.trace_id)
 
         return JSONResponse(
             status_code=status.HTTP_200_OK,

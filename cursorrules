@@ -50,11 +50,11 @@ You write production Python code. You follow the contract strictly.
 
 ## Architecture Rules
 - 2 processes: `app` (FastAPI) and `worker` (standalone Python process, same codebase)
-- Communication: Communication: app INSERTs into outbound_queue → NOTIFY → worker polls with FOR UPDATE SKIP LOCKED
+- Communication: app inserts into outbound_queue (PostgreSQL) → NOTIFY → worker polls with SKIP LOCKED
 - CRM (Impulse): HTTP Basic auth, POST to /api/{entity}/{action}. See CONTRACT §5.
 - LLM: only for intent classification, slot extraction, message rewriting. Never for facts.
-- FSM: deterministic state machine with slot filling. See CONTRACT §7.
-- Idempotency: sha256(phone + schedule_id), PostgreSQL UNIQUE constraint before CRM call. See CONTRACT §10.
+- Conversation Engine: LLM-driven slot tracker with guardrails. See RFC-003. Phases computed from slots, not stored as FSM state.
+- Idempotency: sha256(phone + schedule_id), PostgreSQL UNIQUE constraint. See core/idempotency.py.
 - Budget Guard: hard limits on tokens/cost, auto-switch to static KB. See CONTRACT §12.
 
 ## Testing
@@ -89,13 +89,18 @@ dancebot/
 │   │   ├── filters.py       # Non-text message filter
 │   │   └── dedup.py         # Inbound message deduplication
 │   ├── core/
-│   │   ├── fsm.py           # FSM states enum, transition logic
-│   │   ├── conversation.py  # Session management, slot filling
-│   │   ├── intent.py        # Intent classification wrapper
-│   │   ├── temporal.py      # Relative date parser (code, not LLM)
-│   │   ├── idempotency.py   # Booking dedup guard
-│   │   ├── escalation.py    # Human handoff relay
-│   │   └── session_recovery.py
+│   │   ├── engine.py           # ConversationEngine — main orchestrator (RFC-003)
+│   │   ├── slot_tracker.py     # ConversationPhase, compute_phase()
+│   │   ├── guardrails.py       # 12 guardrail checks on LLM output
+│   │   ├── prompt_builder.py   # System prompt assembly with slots + KB + tools
+│   │   ├── conversation.py     # Session CRUD (PostgreSQL)
+│   │   ├── schedule_flow.py    # Schedule fetch + format (deterministic, no LLM)
+│   │   ├── cancel_flow.py      # Cancel booking flow
+│   │   ├── booking_confirm.py  # Booking creation + receipt
+│   │   ├── response_generator.py # LLM response templates
+│   │   ├── temporal.py         # Date parser (code, not LLM)
+│   │   ├── idempotency.py      # Booking dedup (PostgreSQL)
+│   │   └── escalation.py       # Human handoff relay
 │   ├── ai/
 │   │   ├── router.py        # LLM provider selection
 │   │   ├── budget_guard.py  # Token/cost limits
