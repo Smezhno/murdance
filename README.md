@@ -190,7 +190,7 @@ python -m tests.prompt_regression.runner
 
 ## Лицензия
 
-Проект разрабатывается для студии танцев Tatyana's Studio.
+Проект разрабатывается для студии танцев She dance.
 
 ## Контакты
 
