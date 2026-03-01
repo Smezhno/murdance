@@ -9,7 +9,7 @@ from uuid import UUID
 
 from app.core.conversation import transition_state
 from app.core.idempotency import acquire_booking_lock, release_booking_lock
-from app.core.response_generator import generate_response
+from app.core.response_generator import generate_response, get_booking_restricted_message
 from app.models import ConversationState
 from app.storage.postgres import postgres_storage
 
@@ -94,13 +94,18 @@ async def confirm_booking(
     trace_id: UUID,
     impulse_adapter: Any,
     kb: Any,
-) -> str:
+) -> tuple[str, bool]:
     """Create booking in CRM after user confirmation (CONTRACT §6, §7, §10).
 
-    Single try/except/finally block — logs once, releases lock on failure.
+    Returns (message, created): created=True if booking was created or idempotent duplicate.
+    When created=False (e.g. branch restriction), engine should set confirmed=False.
     """
     if not session.slots.group or not session.slots.datetime_resolved:
-        return "Не все данные заполнены. Укажи направление и дату."
+        return "Не все данные заполнены. Укажи направление и дату.", False
+
+    slots = session.slots
+    if kb.studio.booking_branch and slots.branch and slots.branch != kb.studio.booking_branch:
+        return get_booking_restricted_message(slots.branch, kb.studio.booking_branch), False
 
     await transition_state(session, ConversationState.BOOKING_IN_PROGRESS)
 
@@ -146,13 +151,15 @@ async def confirm_booking(
                     "No schedule found weekday=%s min=%s group=%s trace=%s",
                     target_weekday, target_minutes, session.slots.group, trace_id,
                 )
-                return await generate_response("error_crm", {}, trace_id)
+                msg = await generate_response("error_crm", {}, trace_id)
+                return msg, False
 
         # Phase 3 — idempotency lock (CONTRACT §10)
         is_new, idempotency_msg = await acquire_booking_lock(phone, schedule_id)
         if not is_new:
             await transition_state(session, ConversationState.IDLE)
-            return idempotency_msg
+            return idempotency_msg, True
+
         lock_acquired = True
 
         # Phase 4 — create booking in CRM
@@ -164,13 +171,14 @@ async def confirm_booking(
         )
         success = True
         await transition_state(session, ConversationState.BOOKING_DONE)
-        return generate_receipt(reservation, client, session, kb)
+        return generate_receipt(reservation, client, session, kb), True
 
     except RuntimeError as e:
-        return str(e)
+        return str(e), False
     except Exception:
         logger.exception("confirm_booking unexpected error trace=%s", trace_id)
-        return await generate_response("error_crm", {}, trace_id)
+        msg = await generate_response("error_crm", {}, trace_id)
+        return msg, False
     finally:
         if lock_acquired and not success:
             await release_booking_lock(phone, schedule_id)

@@ -535,16 +535,6 @@ class KnowledgeBase(BaseModel):
         """Format full KB context for system prompt."""
         lines = [f"Студия: {self.studio.name}"]
 
-        # Booking restriction notice
-        if self.studio.booking_branch:
-            lines.append(
-                f"\n⚠️ ВАЖНО: Запись через бота сейчас доступна ТОЛЬКО в филиал «{self.studio.booking_branch}». "
-                "Отвечай на вопросы о других филиалах и преподавателях, но при попытке записаться "
-                f"— бронируй только в «{self.studio.booking_branch}». "
-                "Если клиент хочет в другой филиал — сообщи что запись туда откроется позже, "
-                "и предложи записаться в доступный филиал или связаться с администратором."
-            )
-
         # Branches or single address
         if self.studio.branches:
             lines.append("\nФилиалы:")

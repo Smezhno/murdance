@@ -101,8 +101,11 @@ class ConversationEngine:
             return response
 
         if phase == ConversationPhase.BOOKING and slots.confirmed and not slots.booking_created:
-            response = await confirm_booking(session, trace_id, self._impulse, self._kb)
-            await update_slots(session, booking_created=True)
+            response, created = await confirm_booking(session, trace_id, self._impulse, self._kb)
+            if created:
+                await update_slots(session, booking_created=True)
+            else:
+                await update_slots(session, confirmed=False)
             await self._append_history(session, message.text, response)
             await save_session_to_store(session)
             return self._enforce_length(response, message.channel)
@@ -112,8 +115,11 @@ class ConversationEngine:
             text_lower = message.text.strip().lower()
             if text_lower in _CONFIRM_YES:
                 await update_slots(session, confirmed=True)
-                response = await confirm_booking(session, trace_id, self._impulse, self._kb)
-                await update_slots(session, booking_created=True)
+                response, created = await confirm_booking(session, trace_id, self._impulse, self._kb)
+                if created:
+                    await update_slots(session, booking_created=True)
+                else:
+                    await update_slots(session, confirmed=False)
                 await self._append_history(session, message.text, response)
                 await save_session_to_store(session)
                 return self._enforce_length(response, message.channel)
@@ -221,10 +227,13 @@ class ConversationEngine:
             if result.passed:
                 final_message = result.corrected_message or parsed.message
                 if parsed.intent == "booking" and slots.confirmed and not slots.booking_created:
-                    booking_response = await confirm_booking(
+                    booking_response, created = await confirm_booking(
                         session, trace_id, self._impulse, self._kb
                     )
-                    await update_slots(session, booking_created=True)
+                    if created:
+                        await update_slots(session, booking_created=True)
+                    else:
+                        await update_slots(session, confirmed=False)
                     return booking_response
                 return final_message
 

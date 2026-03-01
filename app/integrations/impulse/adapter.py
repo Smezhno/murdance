@@ -34,21 +34,20 @@ class ImpulseAdapter:
     ) -> list[Schedule]:
         """Get schedule entries (CONTRACT §5).
 
+        Returns all branches so the bot can consult on any branch; booking
+        restriction to a single branch is enforced in confirm_booking.
+
         Args:
             date_from: Start date filter
             date_to: End date filter
             group_id: Group ID filter
 
         Returns:
-            List of schedule entries, filtered by CRM_BRANCH_ID if configured
+            List of schedule entries from all branches
         """
-        from app.config import get_settings
-        settings = get_settings()
-        branch_id = settings.crm_branch_id
-
         try:
-            # Check cache
-            cache_key = f"{date_from}_{date_to}_{group_id}_{branch_id}"
+            # Cache key for full schedule (no branch filter)
+            cache_key = f"{date_from}_{date_to}_{group_id}_all"
             cached = await self.cache.get("schedule", cache_key)
             if cached is not None:
                 return [Schedule(**item) for item in cached]
@@ -60,15 +59,8 @@ class ImpulseAdapter:
                 limit=1000,
             )
 
-            # Parse schedules
+            # Parse schedules — no branch filter; consultation uses all branches
             schedules = [Schedule(**item) for item in data]
-
-            # Filter by branch in memory (CRM API doesn't support branch filter)
-            if branch_id is not None:
-                schedules = [
-                    s for s in schedules
-                    if s.branch is not None and s.branch.get("id") == branch_id
-                ]
 
             await self.cache.set("schedule", [item.model_dump() for item in schedules], cache_key)
             return schedules

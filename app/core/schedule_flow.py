@@ -205,7 +205,27 @@ async def generate_schedule_response(
         return "Не удалось получить расписание. Попробуйте позже или свяжитесь с администратором."
     if not schedules:
         return "На ближайшие дни занятий не найдено. Уточните у администратора."
-    return format_schedule(schedules, group_filter=slots.get("group"), message_text=message_text)
+
+    # Filter by branch when user chose a specific branch (CRM branch name match)
+    slot_branch = (slots.get("branch") or "").strip().lower()
+    if slot_branch and hasattr(schedules[0], "branch_name"):
+        s_branch_norm = slot_branch
+        schedules = [
+            s for s in schedules
+            if getattr(s, "branch_name", None)
+            and (s.branch_name.strip().lower() == s_branch_norm
+                 or s_branch_norm in s.branch_name.strip().lower()
+                 or s.branch_name.strip().lower() in s_branch_norm)
+        ]
+    if not schedules:
+        return "На ближайшие дни занятий не найдено. Уточните у администратора."
+
+    return format_schedule(
+        schedules,
+        group_filter=slots.get("group"),
+        message_text=message_text,
+        teacher_filter=slots.get("teacher"),
+    )
 
 
 def parse_schedule_choice(text: str, groups: list[dict]) -> dict | None:

@@ -285,11 +285,11 @@ async def test_happy_path_booking(kb, mock_impulse, mock_llm):
     assert any(kw in r1.lower() for kw in ["филиал", "семёновск", "гоголя", "привет"]), \
         f"Expected branch question, got: {r1!r}"
 
-    # Turn 2 — branch
+    # Turn 2 — branch (use "Тест" so confirm_booking succeeds when booking_branch is set)
     r2 = await send(
-        "На Семёновской",
+        "В филиал Тест",
         _llm_resp("Отлично! Какое направление тебя интересует?",
-                  slot_updates={"branch": "Семёновская"}),
+                  slot_updates={"branch": "Тест"}),
     )
     assert any(kw in r2.lower() for kw in ["направлен", "стиль", "high heels", "отлично"]), \
         f"Expected direction question, got: {r2!r}"
@@ -355,8 +355,8 @@ async def test_happy_path_booking(kb, mock_impulse, mock_llm):
     # LLM must NOT have been called — fast path bypasses it entirely
     mock_llm.call.assert_not_called()
 
-    # Receipt must contain branch address and dress code
-    assert "Семёновская" in r6, f"Receipt missing branch address: {r6!r}"
+    # Receipt must contain branch (Тест) and dress code
+    assert "Тест" in r6, f"Receipt missing branch: {r6!r}"
     assert any(kw in r6.lower() for kw in ["носочки", "каблуки", "подошв"]), \
         f"Receipt missing dress code: {r6!r}"
 

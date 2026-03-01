@@ -44,6 +44,18 @@ _FALLBACK: dict[str, str] = {
     "suggest_trial": "Приходи на бесплатное пробное — лучший способ попробовать! 🔥",
 }
 
+# Message when booking is blocked to non-test branch (no LLM, fixed text)
+BOOKING_RESTRICTED_TEMPLATE = (
+    "Извините, во время тестового периода я могу бронировать только в филиал «{allowed_branch}». "
+    "Хотите, запишем вас туда?"
+)
+
+
+def get_booking_restricted_message(branch: str, allowed_branch: str) -> str:
+    """Return user message when booking is restricted to a single branch (e.g. test)."""
+    return BOOKING_RESTRICTED_TEMPLATE.format(branch=branch, allowed_branch=allowed_branch)
+
+
 _SYSTEM_PROMPT = """\
 Ты — помощник танцевальной студии She Dance во Владивостоке.
 
