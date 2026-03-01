@@ -1,0 +1,84 @@
+# Prompt regression: Entity resolution (RFC-004 §10.2)
+# Diminutives, colloquial branch/style names, unknown areas, buy_subscription/ask_price intents
+
+name: "Entity Resolution"
+description: "EntityResolver + intent routing: teacher/branch/style resolution, unknown_area, buy_subscription/ask_price"
+
+tests:
+  - name: "diminutive_teacher_name"
+    user: "Хочу к Насте на хилс"
+    expected:
+      not_contains:
+        - "не нашлось"
+        - "не найден"
+        - "нет преподавателя"
+      contains_one_of:
+        - "Анастасия"
+        - "расписание"
+        - "записать"
+        - "филиал"
+
+  - name: "colloquial_branch_name"
+    user: "На Первой речке есть занятия?"
+    expected:
+      contains_one_of:
+        - "Гоголя"
+        - "Красного Знамени"
+        - "расписание"
+        - "направлен"
+
+  - name: "center_disambiguation"
+    user: "Хочу в центре заниматься"
+    expected:
+      contains:
+        - "Алеутская"
+        - "Семёновская"
+      contains_one_of:
+        - "какой"
+        - "удобнее"
+        - "выбрать"
+        - "филиал"
+
+  - name: "colloquial_style_name"
+    user: "Запишите на гёрли"
+    expected:
+      not_contains:
+        - "не найден"
+        - "нет такого"
+        - "не нашла"
+      contains_one_of:
+        - "Girly"
+        - "филиал"
+        - "расписание"
+
+  - name: "unknown_area"
+    user: "Есть что-нибудь на Седанке?"
+    expected:
+      contains_one_of:
+        - "нет филиала"
+        - "ближайш"
+        - "нет в этом районе"
+
+  - name: "buy_subscription_not_booking"
+    user: "Хочу купить абонемент на 8 занятий"
+    expected:
+      not_contains:
+        - "направление"
+        - "какой стиль"
+        - "на какой день"
+      contains_one_of:
+        - "абонемент"
+        - "стоимость"
+        - "цен"
+
+  - name: "ask_price_not_booking"
+    user: "Сколько стоит абонемент?"
+    expected:
+      not_contains:
+        - "на какой день"
+        - "когда удобно"
+      contains_one_of:
+        - "цен"
+        - "стоимость"
+        - "абонемент"
+        - "руб"

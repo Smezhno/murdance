@@ -62,10 +62,13 @@ class GuardrailRunner:
         slots: SlotValues,
         phase: ConversationPhase,
         crm_schedule: list | None = None,
+        executed_tools: set[str] | None = None,
     ) -> GuardrailResult:
         violations: list[str] = []
         message = llm_response.message
         tool_names = {tc.name for tc in llm_response.tool_calls}
+        if executed_tools:
+            tool_names |= executed_tools
         tool_map = {tc.name: tc for tc in llm_response.tool_calls}
 
         # --- Hard checks (original message) ---
@@ -84,6 +87,7 @@ class GuardrailRunner:
         violations += self._g9_receipt_completeness(message, slots, phase)
         violations += self._g10_schedule_id_exists(tool_map, crm_schedule)
         violations += self._g11_datetime_in_future(llm_response)
+        violations += self._g13_intent_context(llm_response)
 
         # --- Auto-fixes (applied after hard checks) ---
         corrected = self._g7_truncate(message)
@@ -139,7 +143,9 @@ class GuardrailRunner:
     # -------------------------------------------------------------------------
 
     def _g3_booking_slots(self, llm_response: LLMResponse, slots: SlotValues) -> list[str]:
-        is_booking = llm_response.intent == "booking" or any(
+        # Only enforce slot requirements when actually attempting to CREATE a booking.
+        # intent="booking" just means "we're in booking flow" — not "create booking now".
+        is_booking = any(
             tc.name == "create_booking" for tc in llm_response.tool_calls
         )
         if not is_booking:
@@ -249,6 +255,36 @@ class GuardrailRunner:
                 return [f"G11: datetime {dt_value!r} is not in the future"]
         except (ValueError, TypeError):
             return [f"G11: could not parse datetime {dt_value!r}"]
+        return []
+
+    # -------------------------------------------------------------------------
+    # G13 — buy_subscription / ask_price must not ask about direction, branch, datetime
+    # -------------------------------------------------------------------------
+
+    def _g13_intent_context(self, llm_response: LLMResponse) -> list[str]:
+        if llm_response.intent not in ("buy_subscription", "ask_price"):
+            return []
+        msg = llm_response.message.lower()
+        booking_question_phrases = [
+            "какое направление",
+            "какой филиал",
+            "в каком филиале",
+            "когда хотите",
+            "в какой день",
+            "на какой день",
+            "какое время",
+            "во сколько",
+            "записать на",
+            "записаться на",
+            "какое направление вас интересует",
+            "какой филиал удобнее",
+        ]
+        for phrase in booking_question_phrases:
+            if phrase in msg:
+                return [
+                    "G13: buy_subscription/ask_price response must not ask about "
+                    "direction, branch, or datetime"
+                ]
         return []
 
     # -------------------------------------------------------------------------

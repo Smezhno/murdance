@@ -60,26 +60,34 @@ _BRANCHES_DATA = [
     {
         "id": "semenovskaya",
         "name": "Семёновская",
+        "crm_branch_id": "ZZ",
         "address": "Семёновская 30а (стеклянное здание, крайняя дверь справа)",
         "styles": ["high-heels", "frame-up-strip", "girly-hiphop", "vogue"],
+        "aliases": ["семёновская", "семеновская", "центр"],
     },
     {
         "id": "gogolya",
         "name": "Гоголя",
+        "crm_branch_id": "XX",
         "address": "Красного Знамени 59, 8 этаж (после лифта направо)",
         "styles": ["high-heels", "frame-up-strip", "dancehall"],
+        "aliases": ["гоголя", "красного знамени", "первая речка"],
     },
     {
-        "id": "churkin",
-        "name": "Чуркин",
+        "id": "cheremukhovaya",
+        "name": "Черемуховая",
+        "crm_branch_id": "WW",
         "address": "Черемуховая 40",
         "styles": ["frame-up-strip", "girly-hiphop"],
+        "aliases": ["черемуховая", "чуркин", "чайка"],
     },
     {
         "id": "aleutskaya",
         "name": "Алеутская",
+        "crm_branch_id": "YY",
         "address": "Алеутская 28",
         "styles": ["high-heels", "vogue", "dancehall"],
+        "aliases": ["алеутская", "центр"],
     },
 ]
 
@@ -141,12 +149,26 @@ class TestBackwardCompat:
 
 class TestBookingBranchModel:
     def test_valid_branch(self):
-        b = BookingBranch(id="test", name="Тест", address="ул. Тест, 1", styles=["high-heels"])
+        b = BookingBranch(
+            id="test",
+            name="Тест",
+            crm_branch_id="TT",
+            address="ул. Тест, 1",
+            styles=["high-heels"],
+            aliases=["тест"],
+        )
         assert b.id == "test"
 
     def test_empty_styles_raises(self):
         with pytest.raises(Exception):
-            BookingBranch(id="test", name="Тест", address="ул. Тест, 1", styles=[])
+            BookingBranch(
+                id="test",
+                name="Тест",
+                crm_branch_id="TT",
+                address="ул. Тест, 1",
+                styles=[],
+                aliases=["тест"],
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -213,8 +235,8 @@ class TestGetBranch:
 
     def test_id_priority_over_name(self):
         # id match should return before name match
-        branch = self.kb.get_branch("churkin")
-        assert branch.name == "Чуркин"
+        branch = self.kb.get_branch("cheremukhovaya")
+        assert branch.name == "Черемуховая"
 
 
 # ---------------------------------------------------------------------------

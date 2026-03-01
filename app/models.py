@@ -116,6 +116,16 @@ class SlotValues(BaseModel):
     booking_created: bool = False
     receipt_sent: bool = False
 
+    # === Raw values from LLM extraction (RFC-004 §5.3) ===
+    teacher_raw: str | None = None
+    style_raw: str | None = None
+    branch_raw: str | None = None
+
+    # === CRM IDs after EntityResolver normalization (RFC-004 §5.3) ===
+    teacher_id: int | str | None = None
+    branch_id: str | None = None
+    style_id: int | str | None = None
+
 
 class Session(BaseModel):
     """Conversation session model (CONTRACT §4, §7).

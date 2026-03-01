@@ -27,7 +27,7 @@ class LLMResponse(BaseModel):
     message: str
     slot_updates: dict[str, Any] = {}
     tool_calls: list[ToolCall] = []
-    intent: str = "continue"  # "continue"|"booking"|"cancel"|"escalate"|"info"
+    intent: str = "continue"  # continue|booking|cancel|escalate|info|buy_subscription|ask_price|ask_trial
 
 
 # =============================================================================
@@ -62,6 +62,7 @@ class PromptBuilder:
         sections += [
             self._format_tools(),
             self._constraints(),
+            self._intent_rules(),
             self._response_format(),
         ]
         return "\n\n".join(s for s in sections if s)
@@ -318,17 +319,43 @@ class PromptBuilder:
 """
 
     # -------------------------------------------------------------------------
-    # §5.6 — Response format instruction
+    # §5.6 — Intent rules (RFC-004 §6)
+    # -------------------------------------------------------------------------
+
+    def _intent_rules(self) -> str:
+        return """\
+ПРАВИЛА INTENT:
+- "buy_subscription": клиент хочет КУПИТЬ абонемент. Отвечай про виды и цены из KB.
+  НЕ спрашивай про даты занятий или направление. Если хочет оплатить — напиши "Для покупки абонемента свяжитесь с администратором" и используй escalate_to_admin.
+- "ask_price": клиент спрашивает про цены. Дай информацию из KB. Можешь уточнить: групповые или индивидуальные. НЕ запускай сценарий записи на занятие.
+- "ask_trial": клиент спрашивает про пробное. Объясни условия из KB (что взять, как записаться).
+  Если хочет записаться на пробное — переключись на intent "booking" и веди в сценарий записи.\
+"""
+
+    # -------------------------------------------------------------------------
+    # §5.7 — Response format instruction
     # -------------------------------------------------------------------------
 
     def _response_format(self) -> str:
         return """\
+ИЗВЛЕЧЕНИЕ СЛОТОВ (RAW):
+Когда клиент упоминает преподавателя, направление или филиал — извлекай СЫРОЙ текст как есть:
+- teacher_raw: имя преподавателя точно как написал клиент (напр. "настюше", "катя", "николаевой")
+- style_raw: направление точно как написал клиент (напр. "каблуки", "гёрли", "хилс")
+- branch_raw: филиал/место точно как написал клиент (напр. "гоголя", "центр", "первая речка")
+
+НЕ нормализуй эти значения. НЕ переводи "настя" в "Анастасия". Извлекай ТЕ СЛОВА, что написал клиент.
+
+Пример: клиент "хочу к Настюше на каблуки на Гоголя" → slot_updates: {"teacher_raw": "настюше", "style_raw": "каблуки", "branch_raw": "гоголя"}
+Пример: клиент "запишите на гёрли" → slot_updates: {"style_raw": "гёрли"}
+Пример: клиент "хочу на занятие завтра вечером" → slot_updates: {"datetime_raw": "завтра вечером"} (teacher_raw, style_raw, branch_raw не заполняй — клиент их не назвал)
+
 ФОРМАТ ОТВЕТА — строго JSON, без markdown-обёртки:
 {
   "message": "текст клиенту (до 300 символов)",
-  "slot_updates": {"branch": "...", "group": "...", ...},
+  "slot_updates": {"branch": "...", "group": "...", "teacher_raw": "...", "style_raw": "...", "branch_raw": "...", ...},
   "tool_calls": [{"name": "get_filtered_schedule", "parameters": {"style": "High Heels"}}],
   "intent": "continue"
 }
-intent: "continue" | "booking" | "cancel" | "escalate" | "info"\
+intent: "continue" | "booking" | "cancel" | "escalate" | "info" | "buy_subscription" | "ask_price" | "ask_trial"\
 """

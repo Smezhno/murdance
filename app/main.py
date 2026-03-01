@@ -16,6 +16,22 @@ from app.queue.outbound import enqueue_message
 from app.storage.postgres import postgres_storage
 
 
+async def _resync_teachers() -> None:
+    """Periodic teacher sync for EntityResolver (RFC-004 §4.3, every 6h)."""
+    from app.core.engine import get_entity_resolver
+    from app.integrations.impulse import get_impulse_adapter
+
+    resolver = get_entity_resolver()
+    if resolver is None or not getattr(resolver, "_teacher", None):
+        return
+    try:
+        impulse = get_impulse_adapter()
+        await resolver._teacher.sync(impulse)
+    except Exception:
+        import structlog
+        structlog.get_logger(__name__).exception("entity_resolver.resync_failed")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan: connect/disconnect storage."""
@@ -29,6 +45,42 @@ async def lifespan(app: FastAPI):
     from app.core.cleanup import start_scheduler
 
     scheduler = start_scheduler()
+
+    # EntityResolver: create, sync teachers, set global (RFC-004 §4.6, §4.3)
+    from pathlib import Path
+
+    from app.core import entity_resolver as entity_resolver_mod
+    from app.core.entity_resolver import (
+        AliasEntityResolver,
+        BranchResolver,
+        StyleResolver,
+        TeacherResolver,
+    )
+    from app.core.engine import set_entity_resolver
+    from app.integrations.impulse import get_impulse_adapter
+    from app.knowledge.base import get_kb
+
+    kb = get_kb()
+    names_dict_path = Path(entity_resolver_mod.__file__).parent / "names_dict.json"
+    teacher_resolver = TeacherResolver(names_dict_path)
+    branch_resolver = BranchResolver(kb)
+    style_resolver = StyleResolver(kb)
+    resolver = AliasEntityResolver(teacher_resolver, branch_resolver, style_resolver)
+    try:
+        impulse = get_impulse_adapter()
+        await teacher_resolver.sync(impulse)
+    except Exception:
+        import logging
+        logging.getLogger(__name__).exception("EntityResolver: teacher sync failed at startup")
+    set_entity_resolver(resolver)
+    scheduler.add_job(
+        _resync_teachers,
+        trigger="interval",
+        hours=6,
+        id="entity_resolver_resync",
+        replace_existing=True,
+        misfire_grace_time=600,
+    )
 
     yield
 

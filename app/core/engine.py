@@ -19,6 +19,7 @@ from app.ai.router import LLMRouter, get_llm_router
 from app.core.booking_confirm import confirm_booking
 from app.core.cancel_flow import get_cancel_flow
 from app.core.conversation import get_or_create_session, save_session_to_store, update_slots
+from app.core.entity_resolver.protocol import EntityResolver
 from app.core.guardrails import GuardrailRunner
 from app.core.prompt_builder import LLMResponse as CoreLLMResponse, PromptBuilder, ToolCall
 from app.core.schedule_flow import fetch_schedule, generate_schedule_response
@@ -49,12 +50,16 @@ class ConversationEngine:
         guardrails: GuardrailRunner,
         impulse_adapter: Any,
         kb: KnowledgeBase,
+        resolver: EntityResolver | None = None,
     ) -> None:
         self._llm = llm_router
         self._pb = prompt_builder
         self._gr = guardrails
         self._impulse = impulse_adapter
         self._kb = kb
+        self._resolver = resolver
+        from app.config import get_settings
+        self._tenant_id = get_settings().crm_tenant
 
     # -------------------------------------------------------------------------
     # Public entry point
@@ -172,6 +177,7 @@ class ConversationEngine:
         trace_id: UUID,
     ) -> str:
         violation_hint = ""
+        executed_tools: set[str] = set()
         for attempt in range(_MAX_RETRIES + 1):
             system_prompt = self._pb.build_system_prompt(slots, phase, crm_schedule)
             if violation_hint:
@@ -202,12 +208,20 @@ class ConversationEngine:
                 )
 
             # Execute tool_calls and re-call LLM with results as context
-            tool_results = await self._execute_tool_calls(parsed.tool_calls, session, trace_id)
+            tool_results = await self._execute_tool_calls(
+                parsed.tool_calls, session, trace_id, user_text=message.text
+            )
             if tool_results:
+                executed_tools.update(tool_results.keys())
                 # Apply slot_updates from the first LLM response before overwriting parsed
                 if parsed.slot_updates:
                     await self._apply_slot_updates(session, parsed.slot_updates)
                     slots = session.slots
+                    clarification = await self._resolve_and_update_slots(
+                        session, parsed.slot_updates, slots
+                    )
+                    if clarification:
+                        return clarification
 
                 for tool_name, result_text in tool_results.items():
                     messages.append({"role": "user", "content": f"[{tool_name}]: {result_text}"})
@@ -222,10 +236,24 @@ class ConversationEngine:
             if parsed.slot_updates:
                 await self._apply_slot_updates(session, parsed.slot_updates)
                 slots = session.slots  # refresh local reference
+                clarification = await self._resolve_and_update_slots(
+                    session, parsed.slot_updates, slots
+                )
+                if clarification:
+                    return clarification
+                slots = session.slots
 
-            result = await self._gr.check(parsed, slots, phase, crm_schedule or None)
+            result = await self._gr.check(
+                parsed, slots, phase, crm_schedule or None, executed_tools=executed_tools
+            )
             if result.passed:
                 final_message = result.corrected_message or parsed.message
+                if parsed.intent == "buy_subscription":
+                    return await self._handle_subscription_inquiry(session, parsed, final_message)
+                if parsed.intent == "ask_price":
+                    return await self._handle_price_inquiry(session, parsed, final_message)
+                if parsed.intent == "ask_trial":
+                    return await self._handle_trial_inquiry(session, parsed, final_message)
                 if parsed.intent == "booking" and slots.confirmed and not slots.booking_created:
                     booking_response, created = await confirm_booking(
                         session, trace_id, self._impulse, self._kb
@@ -252,16 +280,27 @@ class ConversationEngine:
         tool_calls: list[ToolCall],
         session: Any,
         trace_id: UUID,
+        user_text: str = "",
     ) -> dict[str, str]:
         results: dict[str, str] = {}
         for tc in tool_calls:
             try:
                 if tc.name == "get_filtered_schedule":
+                    # Merge LLM tool parameters into slots for this call
+                    # so schedule filters by style/branch/teacher even if slots aren't set yet
+                    call_slots = session.slots.model_dump()
+                    if tc.parameters.get("style") and not call_slots.get("group"):
+                        call_slots["group"] = tc.parameters["style"]
+                    if tc.parameters.get("branch") and not call_slots.get("branch"):
+                        call_slots["branch"] = tc.parameters["branch"]
+                    if tc.parameters.get("teacher") and not call_slots.get("teacher"):
+                        call_slots["teacher"] = tc.parameters["teacher"]
+
                     text = await generate_schedule_response(
                         self._impulse,
-                        session.slots.model_dump(),
+                        call_slots,
                         trace_id,
-                        message_text=tc.parameters.get("message_text", ""),
+                        message_text=user_text or tc.parameters.get("message_text", ""),
                     )
                     results[tc.name] = text
 
@@ -346,6 +385,97 @@ class ConversationEngine:
         if filtered:
             await update_slots(session, **filtered)
 
+    async def _resolve_and_update_slots(
+        self, session: Any, slot_updates: dict, slots: SlotValues
+    ) -> str | None:
+        """Resolve teacher_raw, style_raw, branch_raw to CRM IDs (RFC-004 §5.2).
+
+        Returns clarification message if ambiguous, not found, or unknown area; else None.
+        If resolver is not ready (teacher sync failed), skip resolution so LLM flow continues
+        without normalization instead of returning "не нашла" for every name.
+        """
+        if not self._resolver:
+            return None
+        if not getattr(self._resolver, "is_ready", True):
+            return None
+        teacher_raw = slot_updates.get("teacher_raw") if isinstance(slot_updates.get("teacher_raw"), str) else None
+        style_raw = slot_updates.get("style_raw") if isinstance(slot_updates.get("style_raw"), str) else None
+        branch_raw = slot_updates.get("branch_raw") if isinstance(slot_updates.get("branch_raw"), str) else None
+
+        if teacher_raw and teacher_raw.strip():
+            teachers = await self._resolver.resolve_teacher(teacher_raw.strip(), self._tenant_id)
+            if len(teachers) > 1:
+                names = [t.name for t in teachers]
+                return f"У нас несколько преподавателей: {', '.join(names)}. К кому записать?"
+            if len(teachers) == 1:
+                await update_slots(
+                    session,
+                    teacher=teachers[0].name,
+                    teacher_id=teachers[0].crm_id,
+                    teacher_raw=teacher_raw.strip(),
+                )
+            else:
+                return f"Не нашла преподавателя «{teacher_raw.strip()}». Подсказать, кто ведёт занятия?"
+
+        if style_raw and style_raw.strip():
+            styles = await self._resolver.resolve_style(style_raw.strip(), self._tenant_id)
+            if len(styles) > 1:
+                names = [s.name for s in styles]
+                return f"У нас несколько направлений: {', '.join(names)}. Какое интересно?"
+            if len(styles) == 1:
+                await update_slots(
+                    session,
+                    group=styles[0].name,
+                    style_id=styles[0].crm_id,
+                    style_raw=style_raw.strip(),
+                )
+            else:
+                return f"Не нашла направление «{style_raw.strip()}». Подсказать, какие есть?"
+
+        if branch_raw and branch_raw.strip():
+            branches = await self._resolver.resolve_branch(branch_raw.strip(), self._tenant_id)
+            if len(branches) > 1:
+                names = [b.name for b in branches]
+                return f"У нас несколько филиалов: {', '.join(names)}. В какой удобнее?"
+            if len(branches) == 1:
+                await update_slots(
+                    session,
+                    branch=branches[0].name,
+                    branch_id=branches[0].crm_id,
+                    branch_raw=branch_raw.strip(),
+                )
+            else:
+                unknown = await self._resolver.check_unknown_area(
+                    branch_raw.strip(), self._tenant_id
+                )
+                if unknown:
+                    ua = self._kb.get_unknown_areas()
+                    nearest = (ua.get("nearest_branches") or {}).get(unknown, [])
+                    template = (ua.get("response_template") or "Ближайшие филиалы: {nearest_branches}")
+                    nearest_str = ", ".join(nearest) if nearest else "уточните у администратора"
+                    return template.format(nearest_branches=nearest_str)
+                return f"Не нашла филиал «{branch_raw.strip()}». Подсказать, какие есть?"
+
+        return None
+
+    async def _handle_subscription_inquiry(
+        self, session: Any, parsed: CoreLLMResponse, final_message: str
+    ) -> str:
+        """Answer about subscriptions from KB. Do not ask direction/branch/date (RFC-004 §6)."""
+        return final_message
+
+    async def _handle_price_inquiry(
+        self, session: Any, parsed: CoreLLMResponse, final_message: str
+    ) -> str:
+        """Answer about prices from KB. Do not redirect to booking flow (RFC-004 §6)."""
+        return final_message
+
+    async def _handle_trial_inquiry(
+        self, session: Any, parsed: CoreLLMResponse, final_message: str
+    ) -> str:
+        """Answer about trial from KB. If user wants to book trial → redirect to booking (RFC-004 §6)."""
+        return final_message
+
     async def _append_history(self, session: Any, user_text: str, bot_text: str) -> None:
         messages = list(session.slots.messages)
         messages.append({"role": "user", "content": user_text})
@@ -417,6 +547,20 @@ def _empty_slots() -> dict:
     }
 
 
+_entity_resolver: EntityResolver | None = None
+
+
+def set_entity_resolver(resolver: EntityResolver | None) -> None:
+    """Set global EntityResolver (called from main.py at startup)."""
+    global _entity_resolver
+    _entity_resolver = resolver
+
+
+def get_entity_resolver() -> EntityResolver | None:
+    """Return current global EntityResolver (for resync job)."""
+    return _entity_resolver
+
+
 @lru_cache()
 def get_conversation_engine() -> ConversationEngine:
     kb = get_kb()
@@ -424,4 +568,6 @@ def get_conversation_engine() -> ConversationEngine:
     prompt_builder = PromptBuilder(kb)
     guardrails = GuardrailRunner(kb)
     impulse = get_impulse_adapter()
-    return ConversationEngine(llm_router, prompt_builder, guardrails, impulse, kb)
+    return ConversationEngine(
+        llm_router, prompt_builder, guardrails, impulse, kb, resolver=_entity_resolver
+    )

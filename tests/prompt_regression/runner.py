@@ -15,8 +15,13 @@ RFC-003 additions:
 """
 
 import asyncio
+import os
 import sys
 from pathlib import Path
+
+# Override budget limits for regression so they don't create noise during test run
+os.environ["MAX_TOKENS_PER_HOUR"] = "500000"
+os.environ["MAX_ERRORS_PER_HOUR"] = "200"
 from typing import Any
 from uuid import uuid4
 
@@ -259,6 +264,10 @@ async def main() -> int:
 
     try:
         await postgres_storage.connect()
+        # Reset budget counters so regression runs with fresh limits (no carry-over from previous runs)
+        await postgres_storage.execute(
+            "DELETE FROM budget_counters WHERE provider = $1", "all"
+        )
         load_knowledge_base()
 
         runner = TestRunner()

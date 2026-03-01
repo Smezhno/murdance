@@ -6,7 +6,18 @@ Per CONTRACT §5: Strict validation for schedule, reservation, client, group.
 from datetime import datetime
 from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
+
+
+class Sticker(BaseModel):
+    """Sticker (метка) на занятии — приходит вложенной в /schedule/list."""
+
+    model_config = {"extra": "ignore"}
+
+    id: int = Field(..., description="Sticker ID")
+    name: str = Field(..., description="Sticker label, e.g. «МОЖНО ПРИСОЕДИНИТЬСЯ»")
+    color: str | None = Field(None, description="Hex color without #")
+    icon: str | None = Field(None, description="Icon name or URL")
 
 
 class Schedule(BaseModel):
@@ -14,6 +25,7 @@ class Schedule(BaseModel):
 
     Matches Impulse CRM /schedule/list response structure.
     Regular classes use day+minutesBegin; one-time use dateBegin timestamp.
+    Sticker приходит вложенным в элемент расписания (отдельного sticker/list нет).
     """
 
     model_config = {"extra": "ignore", "populate_by_name": True}
@@ -27,6 +39,7 @@ class Schedule(BaseModel):
     group: dict[str, Any] | None = Field(None, description="Group object with style, teacher, etc.")
     hall: dict[str, Any] | None = Field(None, description="Hall object")
     branch: dict[str, Any] | None = Field(None, description="Branch object")
+    sticker: dict[str, Any] | None = Field(None, description="Sticker object (e.g. «МОЖНО ПРИСОЕДИНИТЬСЯ») from schedule/list")
 
     @property
     def style_name(self) -> str:
@@ -77,6 +90,14 @@ class Schedule(BaseModel):
         """Teacher name from group.teacher1.name."""
         try:
             return self.group.get("teacher1", {}).get("name")
+        except (TypeError, AttributeError):
+            return None
+
+    @property
+    def sticker_name(self) -> str | None:
+        """Sticker label from schedule.sticker.name (e.g. «МОЖНО ПРИСОЕДИНИТЬСЯ»)."""
+        try:
+            return self.sticker.get("name") if self.sticker else None  # type: ignore[union-attr]
         except (TypeError, AttributeError):
             return None
 

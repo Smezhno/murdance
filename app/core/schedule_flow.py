@@ -206,16 +206,42 @@ async def generate_schedule_response(
     if not schedules:
         return "На ближайшие дни занятий не найдено. Уточните у администратора."
 
-    # Filter by branch when user chose a specific branch (CRM branch name match)
-    slot_branch = (slots.get("branch") or "").strip().lower()
-    if slot_branch and hasattr(schedules[0], "branch_name"):
-        s_branch_norm = slot_branch
+    # Filter by branch_id when present (RFC-004), else by branch name
+    branch_id = slots.get("branch_id")
+    if branch_id is not None and schedules and hasattr(schedules[0], "branch"):
+        sid = str(branch_id)
         schedules = [
             s for s in schedules
-            if getattr(s, "branch_name", None)
-            and (s.branch_name.strip().lower() == s_branch_norm
-                 or s_branch_norm in s.branch_name.strip().lower()
-                 or s.branch_name.strip().lower() in s_branch_norm)
+            if getattr(s, "branch", None) and str((s.branch or {}).get("id")) == sid
+        ]
+    else:
+        slot_branch = (slots.get("branch") or "").strip().lower()
+        if slot_branch and schedules and hasattr(schedules[0], "branch_name"):
+            s_branch_norm = slot_branch
+            schedules = [
+                s for s in schedules
+                if getattr(s, "branch_name", None)
+                and (s.branch_name.strip().lower() == s_branch_norm
+                     or s_branch_norm in s.branch_name.strip().lower()
+                     or s.branch_name.strip().lower() in s_branch_norm)
+            ]
+    # Filter by style_id when present (RFC-004)
+    style_id = slots.get("style_id")
+    if style_id is not None and schedules and hasattr(schedules[0], "group"):
+        sid = str(style_id)
+        schedules = [
+            s for s in schedules
+            if getattr(s, "group", None)
+            and str((s.group or {}).get("style", {}).get("id")) == sid
+        ]
+    # Filter by teacher_id when present (RFC-004)
+    teacher_id = slots.get("teacher_id")
+    if teacher_id is not None and schedules and hasattr(schedules[0], "group"):
+        tid = str(teacher_id)
+        schedules = [
+            s for s in schedules
+            if getattr(s, "group", None)
+            and str((s.group or {}).get("teacher1", {}).get("id")) == tid
         ]
     if not schedules:
         return "На ближайшие дни занятий не найдено. Уточните у администратора."

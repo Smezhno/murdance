@@ -1,0 +1,5 @@
+# For local development: expose Postgres so the app on host can connect
+services:
+  postgres:
+    ports:
+      - "127.0.0.1:5432:5432"

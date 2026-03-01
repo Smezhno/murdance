@@ -15,6 +15,7 @@ You write production Python code. You follow the contract strictly.
 - PostgreSQL outbound_queue + LISTEN/NOTIFY is the queue. FOR UPDATE SKIP LOCKED for worker concurrency.
 - No Redis. All state in PostgreSQL. Do not import redis or use redis anywhere.
 - All conversations logged to Postgres with trace_id.
+- LLM extracts raw slot values (teacher_raw, style_raw, branch_raw). EntityResolver normalizes raw values to CRM IDs. Resolver does NOT parse user text — only normalizes pre-extracted values.
 
 ## Before Writing Code
 1. Read the relevant CONTRACT.md section(s)
@@ -30,6 +31,12 @@ You write production Python code. You follow the contract strictly.
 - structlog (structured logging)
 - pydantic v2 (all data models, strict validation)
 - Docker Compose (app + worker + postgres + caddy)
+
+## CRITICAL: Never Touch .env
+- **NEVER** edit, create, overwrite, or copy into `.env`.
+- **NEVER** run `cp .env.example .env` or any command that creates/overwrites `.env`.
+- `.env` contains user secrets; the user manages it manually. Only read from it via app/config.
+- If a task says "ensure .env exists" or "create .env" — do NOT create/overwrite it. Tell the user to copy `.env.example` to `.env` and fill values themselves.
 
 ## Do NOT Use
 - Kafka, RabbitMQ, or any message broker
@@ -56,6 +63,7 @@ You write production Python code. You follow the contract strictly.
 - Conversation Engine: LLM-driven slot tracker with guardrails. See RFC-003. Phases computed from slots, not stored as FSM state.
 - Idempotency: sha256(phone + schedule_id), PostgreSQL UNIQUE constraint. See core/idempotency.py.
 - Budget Guard: hard limits on tokens/cost, auto-switch to static KB. See CONTRACT §12.
+- Entity Resolver: deterministic normalization of user input to CRM IDs. No LLM inside resolvers. Exact match first, pymorphy3 fallback for case forms only. See RFC-004.
 
 ## Testing
 - Prompt regression tests in YAML format (tests/prompt_regression/)
@@ -100,7 +108,16 @@ dancebot/
 │   │   ├── response_generator.py # LLM response templates
 │   │   ├── temporal.py         # Date parser (code, not LLM)
 │   │   ├── idempotency.py      # Booking dedup (PostgreSQL)
-│   │   └── escalation.py       # Human handoff relay
+│   │   ├── escalation.py       # Human handoff relay
+│   │   └── entity_resolver/
+│   │       ├── __init__.py           # Exports: EntityResolver protocol, ResolvedEntity, models
+│   │       ├── protocol.py           # EntityResolver Protocol (interface)
+│   │       ├── models.py             # ResolvedEntity, ResolvedEntities dataclasses
+│   │       ├── teacher_resolver.py   # TeacherResolver: names_dict + CRM sync + pymorphy3
+│   │       ├── branch_resolver.py    # BranchResolver: aliases from studio.yaml
+│   │       ├── style_resolver.py     # StyleResolver: aliases from studio.yaml
+│   │       ├── alias_resolver.py     # AliasEntityResolver: implements Protocol
+│   │       └── names_dict.json       # Static dictionary of Russian name diminutives (~300 names)
 │   ├── ai/
 │   │   ├── router.py        # LLM provider selection
 │   │   ├── budget_guard.py  # Token/cost limits

@@ -15,7 +15,7 @@ logger = logging.getLogger(__name__)
 
 import pymorphy3
 import yaml
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from app.config import get_settings
 
@@ -51,22 +51,32 @@ class Branch(BaseModel):
 
 
 class BookingBranch(BaseModel):
-    """Top-level branch entry for booking routing (RFC-003 §8.1).
+    """Top-level branch entry for booking routing (RFC-003 §8.1, RFC-004 §4.4).
 
-    Distinct from studio.branches (which carries phone/halls).
     styles[] matches services[].id (hyphen-separated).
+    aliases (lowercase) used by BranchResolver.
     """
 
     id: str = Field(..., description="Branch slug ID")
     name: str = Field(..., description="Branch display name")
+    crm_branch_id: str = Field(..., description="CRM branch ID for API calls")
     address: str = Field(..., description="Full address with navigation hint")
     styles: list[str] = Field(..., description="Service IDs available at this branch")
+    aliases: list[str] = Field(..., description="Lowercase aliases for entity resolver")
 
     @field_validator("styles")
     @classmethod
     def validate_styles_non_empty(cls, v: list[str]) -> list[str]:
         if not v:
             raise ValueError("Branch styles must be a non-empty list")
+        return v
+
+    @field_validator("aliases")
+    @classmethod
+    def validate_aliases_lowercase(cls, v: list[str]) -> list[str]:
+        for a in v:
+            if not isinstance(a, str) or a != a.lower():
+                raise ValueError(f"Branch alias {a!r} must be lowercase")
         return v
 
 
@@ -257,6 +267,16 @@ class KnowledgeBase(BaseModel):
         description="Active promotions (RFC-003 OQ-V2-3)",
     )
 
+    # === RFC-004 Entity Resolver ===
+    style_aliases: dict[str, dict] = Field(
+        default_factory=dict,
+        description="Style name → {crm_style_id, aliases} for StyleResolver (RFC-004 §4.5)",
+    )
+    unknown_areas: dict[str, Any] = Field(
+        default_factory=dict,
+        description="Unknown area aliases and nearest_branches (RFC-004 §4.4)",
+    )
+
     @field_validator("schema_version")
     @classmethod
     def validate_schema_version(cls, v: str) -> str:
@@ -317,6 +337,40 @@ class KnowledgeBase(BaseModel):
                     raise ValueError(f"style_recommendations[{key!r}] must be a non-empty list")
         return v
 
+    @field_validator("style_aliases")
+    @classmethod
+    def validate_style_aliases_structure(cls, v: dict[str, Any]) -> dict[str, Any]:
+        """Each style entry must have crm_style_id and non-empty aliases (RFC-004 §4.5)."""
+        if v:
+            for name, data in v.items():
+                if not isinstance(data, dict):
+                    raise ValueError(f"style_aliases[{name!r}] must be a dict")
+                if data.get("crm_style_id") is None and data.get("crm_id") is None:
+                    raise ValueError(f"style_aliases[{name!r}] must have crm_style_id (or crm_id)")
+                aliases = data.get("aliases")
+                if not aliases or not isinstance(aliases, list):
+                    raise ValueError(f"style_aliases[{name!r}] must have non-empty aliases list")
+        return v
+
+    @model_validator(mode="after")
+    def validate_branch_unknown_conflict(self) -> "KnowledgeBase":
+        """No alias may appear in both branches and unknown_areas (RFC-004)."""
+        branch_aliases: set[str] = set()
+        for b in self.branches:
+            for a in b.aliases:
+                branch_aliases.add(a.strip().lower())
+        ua = self.unknown_areas or {}
+        unknown_list = ua.get("aliases") or []
+        for a in unknown_list:
+            if isinstance(a, str):
+                key = a.strip().lower()
+                if key in branch_aliases:
+                    raise ValueError(
+                        f"Alias {a!r} appears in both branches and unknown_areas; "
+                        "must be in only one (RFC-004 validation)"
+                    )
+        return self
+
     def get_branch(self, name_or_id: str) -> BookingBranch | None:
         """Get booking branch by exact id or exact case-insensitive name match."""
         target = name_or_id.strip()
@@ -350,6 +404,25 @@ class KnowledgeBase(BaseModel):
         """Get branch address by name or id. Returns None if not found."""
         branch = self.get_branch(branch_name)
         return branch.address if branch else None
+
+    def get_branch_aliases(self) -> dict[str, list[dict[str, Any]]]:
+        """Return alias → list of {name, crm_branch_id} for BranchResolver (RFC-004)."""
+        result: dict[str, list[dict[str, Any]]] = {}
+        for b in self.branches:
+            entry = {"name": b.name, "crm_branch_id": b.crm_branch_id}
+            for a in b.aliases:
+                key = a.strip().lower()
+                if key:
+                    result.setdefault(key, []).append(entry)
+        return result
+
+    def get_style_aliases(self) -> dict[str, Any]:
+        """Return style_aliases dict for StyleResolver (RFC-004 §4.5)."""
+        return dict(self.style_aliases)
+
+    def get_unknown_areas(self) -> dict[str, Any]:
+        """Return unknown_areas dict (aliases, response_template, nearest_branches) (RFC-004 §4.4)."""
+        return dict(self.unknown_areas or {})
 
     def get_active_promotions(self) -> list[dict]:
         """Return all promotions (active/inactive flag not yet implemented — RFC-003 OQ-V2-3)."""
@@ -532,16 +605,17 @@ class KnowledgeBase(BaseModel):
         return "\n".join(lines)
 
     def format_for_llm(self) -> str:
-        """Format full KB context for system prompt."""
+        """Format full KB context for system prompt.
+
+        Single source of truth for branches: self.branches (same as EntityResolver).
+        """
         lines = [f"Студия: {self.studio.name}"]
 
-        # Branches or single address
-        if self.studio.branches:
+        # Branches — single source (RFC-004 §7), same list as BranchResolver uses
+        if self.branches:
             lines.append("\nФилиалы:")
-            for b in self.studio.branches:
-                halls_str = ", ".join(b.halls) if b.halls else ""
-                halls_part = f" | Залы: {halls_str}" if halls_str else ""
-                lines.append(f"- {b.name}: {b.address}, тел. {b.phone}{halls_part}")
+            for b in self.branches:
+                lines.append(f"- {b.name}: {b.address}")
         else:
             lines.append(f"Адрес: {self.studio.address}")
             lines.append(f"Телефон: {self.studio.phone}")

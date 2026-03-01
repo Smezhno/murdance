@@ -19,9 +19,11 @@ class YandexGPTProvider:
     def __init__(self) -> None:
         """Initialize YandexGPT provider."""
         self.settings = get_settings()
-        self.api_key = self.settings.yandexgpt_api_key
-        self.folder_id = self.settings.yandexgpt_folder_id
-        self.model = "yandexgpt-32k/latest"
+        # Strip whitespace: .env often has trailing newline or spaces → 401
+        self.api_key = (self.settings.yandexgpt_api_key or "").strip()
+        self.folder_id = (self.settings.yandexgpt_folder_id or "").strip()
+        # Model ID per Yandex docs: yandexgpt (Pro) or yandexgpt-lite; /latest = production branch
+        self.model = "yandexgpt/latest"
         self.base_url = "https://llm.api.cloud.yandex.net/foundationModels/v1/completion"
         # Persistent httpx client
         self._client: httpx.AsyncClient | None = None
@@ -86,6 +88,7 @@ class YandexGPTProvider:
             headers={
                 "Authorization": f"Api-Key {self.api_key}",
                 "Content-Type": "application/json",
+                "x-folder-id": self.folder_id,
             },
         )
         response.raise_for_status()
