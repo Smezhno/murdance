@@ -63,8 +63,8 @@ class TeacherResolver:
 
     async def sync(self, crm_adapter: Any) -> None:
         """
-        1. Call CRM: teacher/list → list of {id, name}
-        2. For each teacher: split name, names_dict diminutives + first + full + surname (both genders)
+        1. Call CRM: teacher/list → list of {id, name, lastName}
+        2. For each teacher: build full name from name+lastName, names_dict diminutives + first + full + surname (both genders)
         3. Store lookup: alias → list[ResolvedEntity]
         """
         teachers = await crm_adapter.get_teacher_list()
@@ -72,10 +72,15 @@ class TeacherResolver:
 
         for t in teachers:
             tid = t.get("id")
-            name = t.get("name") or ""
-            if tid is None or not name.strip():
+            first_name = (t.get("name") or "").strip()
+            last_name = (t.get("lastName") or "").strip()
+
+            if tid is None or not first_name:
                 continue
-            full = name.strip()
+
+            # Build full name: "Имя Фамилия" (e.g. "Катя Матюха")
+            full = f"{first_name} {last_name}".strip() if last_name else first_name
+
             parts = full.split()
             first = parts[0].lower() if parts else ""
             last = parts[-1].lower() if len(parts) > 1 else ""

@@ -145,7 +145,7 @@ def mock_impulse(kb):
     future_dt = (now + timedelta(days=days_ahead)).replace(hour=19, minute=0, second=0, microsecond=0)
     schedule_entry = SimpleNamespace(
         id=42,
-        day=future_dt.weekday(),
+        day=future_dt.weekday() + 1,  # Impulse: 1=Mon
         minutes_begin=19 * 60,
         style_name="High Heels",
         teacher_name="Анастасия Николаева",
@@ -263,7 +263,7 @@ async def test_diminutive_name_booking(kb, mock_impulse, mock_llm):
         tool_calls=[{"name": "get_filtered_schedule", "parameters": {"style": "High Heels"}}],
     ))
     with patch("app.core.engine.generate_schedule_response", new=AsyncMock(
-            return_value="Расписание High Heels (Тест): среда, пятница 19:00.")):
+            return_value=("Расписание High Heels (Тест): среда, пятница 19:00.", {}))):
         r2 = await engine.handle_message(_make_message("В филиал Тест", chat_id), uuid4())
     responses.append(r2)
     assert "не нашла" not in r2.lower(), f"Branch should resolve, got: {r2!r}"
@@ -328,7 +328,7 @@ async def test_center_disambiguation(kb, mock_impulse, mock_llm):
         tool_calls=[{"name": "get_filtered_schedule", "parameters": {"style": "High Heels"}}],
     ))
     with patch("app.core.engine.generate_schedule_response", new=AsyncMock(
-            return_value="Расписание High Heels (Алеутская): среда 19:00.")):
+            return_value=("Расписание High Heels (Алеутская): среда 19:00.", {}))):
         r2 = await engine.handle_message(_make_message("Алеутская", chat_id), uuid4())
     assert "алеутская" in r2.lower() or "расписан" in r2.lower(), f"Should proceed with one branch: {r2!r}"
 

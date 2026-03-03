@@ -53,6 +53,9 @@ def compute_phase(
     ):
         return ConversationPhase.CONFIRMATION
 
+    if slots.schedule_id and (slots.datetime_resolved or slots.schedule_shown):
+        return ConversationPhase.CONFIRMATION
+
     if slots.datetime_resolved or slots.schedule_shown:
         # TODO: validate with real conversations — may need datetime_resolved required here
         # schedule_shown=True without datetime_resolved follows RFC-003 §4.2 exactly,

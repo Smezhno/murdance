@@ -5,9 +5,9 @@ schema_version: "1.0"
 # =============================================================================
 studio:
   name: "She Dance"
-  # ⚠️ ПЕРЕД ПРОДАКШН-ДЕПЛОЕМ: заменить на реальное название филиала или убрать поле.
-  # Пока стоит "Тест" — бот принимает запись ТОЛЬКО в тестовый филиал.
-  booking_branch: "Тест"
+  # Поле null — бронирование доступно во всех филиалах.
+  # Чтобы ограничить одним филиалом: booking_branch: "Название филиала"
+  booking_branch: null
   address: "Владивосток"
   phone: "+7 (914) 700-24-31"
   schedule: "Расписание занятий доступно через бота, сайт или в Telegram-канале. Примеры: группы для начинающих и продвинутых по стилям, утро/день/вечер."
@@ -432,7 +432,7 @@ faq:
 branches:
   - id: "gogolya"
     name: "Гоголя"
-    crm_branch_id: "XX"
+    crm_branch_id: "1"
     address: "Красного Знамени 59, 8 этаж (после лифта направо)"
     styles: ["high-heels", "frame-up-strip", "dancehall"]
     aliases:
@@ -444,7 +444,7 @@ branches:
 
   - id: "aleutskaya"
     name: "Алеутская"
-    crm_branch_id: "YY"
+    crm_branch_id: "9"
     address: "Алеутская 28"
     styles: ["high-heels", "vogue", "dancehall"]
     aliases:
@@ -457,7 +457,7 @@ branches:
 
   - id: "semenovskaya"
     name: "Семёновская"
-    crm_branch_id: "ZZ"
+    crm_branch_id: "7"
     address: "Семёновская 30а (стеклянное здание, крайняя дверь справа)"
     styles: ["high-heels", "frame-up-strip", "girly-hiphop", "vogue"]
     aliases:
@@ -469,7 +469,7 @@ branches:
 
   - id: "cheremukhovaya"
     name: "Черемуховая"
-    crm_branch_id: "WW"
+    crm_branch_id: "8"
     address: "Черемуховая 40"
     styles: ["frame-up-strip", "girly-hiphop"]
     aliases:
@@ -479,7 +479,7 @@ branches:
 
   - id: "test"
     name: "Тест"
-    crm_branch_id: "TT"
+    crm_branch_id: "10"
     address: "Владивосток, филиал Тест"
     styles: ["high-heels"]
     aliases:
@@ -490,26 +490,24 @@ branches:
 # =============================================================================
 style_aliases:
   "High Heels":
-    crm_style_id: 5
+    crm_style_id: 22
     aliases: ["хилс", "хиллз", "хилз", "каблуки", "heels", "на каблуках"]
   "Girly Hip-Hop":
-    crm_style_id: 8
+    crm_style_id: 24
     aliases: ["гёрли", "герли", "girly", "гёрл"]
-  # Contemporary: нет в services[]; при необходимости проверить наличие в CRM и id
-  "Contemporary":
-    crm_style_id: 3
-    aliases: ["контемп", "контемпорари", "contemporary"]
+  
+
   "Frame Up Strip":
-    crm_style_id: 12
+    crm_style_id: 23
     aliases: ["стрип", "strip", "фрейм ап", "frame up"]
   "Dancehall":
-    crm_style_id: 9
+    crm_style_id: 26
     aliases: ["дэнсхолл", "дэнс холл", "dancehall"]
   "Dancehall Female":
-    crm_style_id: 10  # уточнить реальный ID в CRM
+    crm_style_id: 27  # уточнить реальный ID в CRM
     aliases: ["дэнсхолл фемейл", "денсхолл женский", "женский дэнсхолл", "dancehall female"]
   "Vogue":
-    crm_style_id: 11  # уточнить реальный ID в CRM
+    crm_style_id: 25  # уточнить реальный ID в CRM
     aliases: ["вог", "воуг", "вогинг", "vogue"]
 
 # =============================================================================
@@ -581,6 +579,19 @@ escalation:
     - "проблема с оплатой"
     - "аренда зала"
     - "мастер-класс"
+
+# =============================================================================
+# Availability — стикеры CRM для доступности групп (RFC-005 §8)
+# =============================================================================
+availability:
+  sticker_mapping:
+    open_keywords: ["МОЖНО ПРИСОЕДИНИТЬСЯ"]
+    closed_keywords: ["НЕЛЬЗЯ ПРИСОЕДИНИТЬСЯ", "НЕЛЬЗЬЯ ПРИСОЕДИНИТЬСЯ", "ЗАКРЫТО", "ЗАКРЫТ"]
+    priority_keywords: ["НОВАЯ ХОРЕОГРАФИЯ"]
+    holiday_keywords: ["ВЫХОДНОЙ"]
+    info_keywords: ["СТАРТ", "ОТКРЫТЫЙ УРОК"]
+    unknown_action: "open"
+  max_lookahead_weeks: 4
 
 # =============================================================================
 # Additional — прочая полезная информация для продаж

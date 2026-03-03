@@ -57,7 +57,8 @@ tests:
       contains_one_of: ["филиал", "удобнее заниматься", "Гоголя", "Семёновская", "среда", "пятниц", "19:00", "время", "администр", "уточн"]
 
   - name: "no_spots_alternative"
-    skip: true  # crm_mock not yet wired — non-deterministic without CRM stubbing
+    skip: true
+    skip_reason: "crm_mock not wired"
     setup:
       crm_mock:
         no_spots: true

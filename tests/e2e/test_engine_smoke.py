@@ -165,7 +165,7 @@ def mock_impulse():
     future_dt = datetime.now(timezone.utc) + timedelta(days=7)
     schedule_entry = MagicMock()
     schedule_entry.id = "42"
-    schedule_entry.day = future_dt.weekday()       # weekday of future_dt
+    schedule_entry.day = future_dt.weekday() + 1   # Impulse: 1=Mon
     schedule_entry.minutes_begin = 19 * 60         # 19:00 → 1140 minutes
     schedule_entry.style_name = "High Heels"
     schedule_entry.teacher_name = "Катя"
@@ -309,7 +309,7 @@ async def test_happy_path_booking(kb, mock_impulse, mock_llm):
     mock_llm.call = AsyncMock(side_effect=[first_resp, second_resp])
 
     with patch("app.core.engine.generate_schedule_response",
-               new=AsyncMock(return_value="Расписание High Heels: есть места на этой неделе.")):
+               new=AsyncMock(return_value=("Расписание High Heels: есть места на этой неделе.", {}))):
         r3 = await engine.handle_message(_make_message("High Heels, я новичок", chat_id), uuid4())
     responses.append(r3)
 

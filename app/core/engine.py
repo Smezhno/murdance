@@ -2,20 +2,23 @@
 
 Replaces BookingFlow.process_message(). booking_flow.py is kept until
 integration testing is complete (RFC-003 §7.3).
-
-Do NOT modify: cancel_flow.py, schedule_flow.py, booking_confirm.py,
-               idempotency.py, conversation.py.
+RFC-005: pre-booking availability check (closed_group_handler).
 """
 
 import json
 import logging
-from datetime import datetime
+from datetime import date, datetime
 from functools import lru_cache
 from typing import Any
 from uuid import UUID
+from zoneinfo import ZoneInfo
 
 from app.ai.providers.base import LLMResponse as ProviderLLMResponse
 from app.ai.router import LLMRouter, get_llm_router
+from app.core.availability.closed_group_handler import (
+    check_closed_before_booking,
+    handle_closed_group,
+)
 from app.core.booking_confirm import confirm_booking
 from app.core.cancel_flow import get_cancel_flow
 from app.core.conversation import get_or_create_session, save_session_to_store, update_slots
@@ -25,6 +28,7 @@ from app.core.prompt_builder import LLMResponse as CoreLLMResponse, PromptBuilde
 from app.core.schedule_flow import fetch_schedule, generate_schedule_response
 from app.core.slot_tracker import ConversationPhase, compute_phase
 from app.integrations.impulse import get_impulse_adapter
+from app.integrations.impulse.models import impulse_day_to_weekday
 from app.knowledge.base import KnowledgeBase, get_kb
 from app.models import SlotValues, UnifiedMessage
 
@@ -51,6 +55,7 @@ class ConversationEngine:
         impulse_adapter: Any,
         kb: KnowledgeBase,
         resolver: EntityResolver | None = None,
+        availability_provider: Any = None,
     ) -> None:
         self._llm = llm_router
         self._pb = prompt_builder
@@ -58,6 +63,7 @@ class ConversationEngine:
         self._impulse = impulse_adapter
         self._kb = kb
         self._resolver = resolver
+        self._availability = availability_provider
         from app.config import get_settings
         self._tenant_id = get_settings().crm_tenant
 
@@ -106,20 +112,15 @@ class ConversationEngine:
             return response
 
         if phase == ConversationPhase.BOOKING and slots.confirmed and not slots.booking_created:
-            response, created = await confirm_booking(session, trace_id, self._impulse, self._kb)
-            if created:
-                await update_slots(session, booking_created=True)
+            missing = self._get_missing_booking_slots(slots)
+            if missing:
+                pass  # Fall through to LLM to collect missing slots
             else:
-                await update_slots(session, confirmed=False)
-            await self._append_history(session, message.text, response)
-            await save_session_to_store(session)
-            return self._enforce_length(response, message.channel)
-
-        # --- Confirmation fast path (user says да/нет) ---
-        if phase == ConversationPhase.CONFIRMATION:
-            text_lower = message.text.strip().lower()
-            if text_lower in _CONFIRM_YES:
-                await update_slots(session, confirmed=True)
+                closed_msg = await self._maybe_handle_closed_before_booking(session, trace_id)
+                if closed_msg:
+                    await self._append_history(session, message.text, closed_msg)
+                    await save_session_to_store(session)
+                    return self._enforce_length(closed_msg, message.channel)
                 response, created = await confirm_booking(session, trace_id, self._impulse, self._kb)
                 if created:
                     await update_slots(session, booking_created=True)
@@ -128,7 +129,39 @@ class ConversationEngine:
                 await self._append_history(session, message.text, response)
                 await save_session_to_store(session)
                 return self._enforce_length(response, message.channel)
-            if text_lower in _CONFIRM_NO:
+
+        # --- Confirmation fast path (user says да/нет) ---
+        if phase == ConversationPhase.CONFIRMATION:
+            text_lower = message.text.strip().lower()
+            first_word = (text_lower.split(",")[0].strip().split()[0] or "") if text_lower else ""
+            if first_word in _CONFIRM_YES or text_lower in _CONFIRM_YES:
+                if getattr(slots, "escalation_pending_reason", None):
+                    await update_slots(session, escalation_pending_reason=None)
+                    response = self._safe_fallback(ConversationPhase.ADMIN_HANDOFF)
+                    await self._append_history(session, message.text, response)
+                    return response
+
+                missing = self._get_missing_booking_slots(slots)
+                if missing:
+                    await update_slots(session, confirmed=True)
+                    pass  # Fall through to LLM loop which will ask for missing slots
+                else:
+                    await update_slots(session, confirmed=True)
+                    closed_msg = await self._maybe_handle_closed_before_booking(session, trace_id)
+                    if closed_msg:
+                        await self._append_history(session, message.text, closed_msg)
+                        await save_session_to_store(session)
+                        return self._enforce_length(closed_msg, message.channel)
+                    response, created = await confirm_booking(session, trace_id, self._impulse, self._kb)
+                    if created:
+                        await update_slots(session, booking_created=True)
+                    else:
+                        await update_slots(session, confirmed=False)
+                    await self._append_history(session, message.text, response)
+                    await save_session_to_store(session)
+                    return self._enforce_length(response, message.channel)
+            first_word_no = (text_lower.split(",")[0].strip().split()[0] or "") if text_lower else ""
+            if first_word_no in _CONFIRM_NO or text_lower in _CONFIRM_NO:
                 await update_slots(session, **_empty_slots())
                 response = "Хорошо, отменяю. Напиши, если захочешь записаться снова."
                 await self._append_history(session, message.text, response)
@@ -193,7 +226,9 @@ class ConversationEngine:
                 logger.error("LLM call failed (attempt %d): %s", attempt, exc)
                 return self._safe_fallback(phase)
 
+            logger.info("LLM_RAW_RESPONSE: %.500s", (raw.text or "")[:500])
             parsed = self._parse_llm_response(raw.text)
+            print(f"DEBUG_LLM: {raw.text[:500]}")
 
             # If LLM requested create_booking, convert to intent="booking" so guardrails
             # (G3, G4) validate slots and confirmed=True BEFORE any CRM write happens.
@@ -208,12 +243,19 @@ class ConversationEngine:
                 )
 
             # Execute tool_calls and re-call LLM with results as context
-            tool_results = await self._execute_tool_calls(
+            tool_results, availability_cache = await self._execute_tool_calls(
                 parsed.tool_calls, session, trace_id, user_text=message.text
             )
             if tool_results:
                 executed_tools.update(tool_results.keys())
                 # Apply slot_updates from the first LLM response before overwriting parsed
+                if parsed.slot_updates:
+                    logger.info("LLM_SLOT_UPDATES: %s", parsed.slot_updates)
+                else:
+                    logger.info(
+                        "LLM_NO_SLOT_UPDATES: message=%.200s",
+                        (parsed.message or "")[:200],
+                    )
                 if parsed.slot_updates:
                     await self._apply_slot_updates(session, parsed.slot_updates)
                     slots = session.slots
@@ -224,7 +266,8 @@ class ConversationEngine:
                         return clarification
 
                 for tool_name, result_text in tool_results.items():
-                    messages.append({"role": "user", "content": f"[{tool_name}]: {result_text}"})
+                    capped = result_text[:3000] if len(result_text) > 3000 else result_text
+                    messages.append({"role": "user", "content": f"[{tool_name}]: {capped}"})
                 try:
                     raw2: ProviderLLMResponse = await self._llm.call(messages, trace_id=trace_id)
                     parsed = self._parse_llm_response(raw2.text)
@@ -233,6 +276,13 @@ class ConversationEngine:
                     return self._safe_fallback(phase)
 
             # Apply slot_updates from the final parsed response
+            if parsed.slot_updates:
+                logger.info("LLM_SLOT_UPDATES: %s", parsed.slot_updates)
+            else:
+                logger.info(
+                    "LLM_NO_SLOT_UPDATES: message=%.200s",
+                    (parsed.message or "")[:200],
+                )
             if parsed.slot_updates:
                 await self._apply_slot_updates(session, parsed.slot_updates)
                 slots = session.slots  # refresh local reference
@@ -244,7 +294,12 @@ class ConversationEngine:
                 slots = session.slots
 
             result = await self._gr.check(
-                parsed, slots, phase, crm_schedule or None, executed_tools=executed_tools
+                parsed,
+                slots,
+                phase,
+                crm_schedule or None,
+                executed_tools=executed_tools,
+                availability_cache=availability_cache if self._availability else None,
             )
             if result.passed:
                 final_message = result.corrected_message or parsed.message
@@ -255,6 +310,12 @@ class ConversationEngine:
                 if parsed.intent == "ask_trial":
                     return await self._handle_trial_inquiry(session, parsed, final_message)
                 if parsed.intent == "booking" and slots.confirmed and not slots.booking_created:
+                    missing = self._get_missing_booking_slots(slots)
+                    if missing:
+                        return final_message  # LLM asked for missing info
+                    closed_msg = await self._maybe_handle_closed_before_booking(session, trace_id)
+                    if closed_msg:
+                        return closed_msg
                     booking_response, created = await confirm_booking(
                         session, trace_id, self._impulse, self._kb
                     )
@@ -267,6 +328,22 @@ class ConversationEngine:
 
             violation_hint = "; ".join(result.violations)
             logger.warning("guardrail violation (attempt %d): %s", attempt, violation_hint)
+            # G14 block → return _handle_closed_group message instead of retry
+            if any("G14:" in v for v in result.violations):
+                avail = None
+                sid = slots.schedule_id
+                dt_resolved = slots.datetime_resolved
+                if sid and dt_resolved and availability_cache:
+                    try:
+                        cache_key = f"{int(sid)}:{dt_resolved.date().isoformat()}"
+                        avail = availability_cache.get(cache_key)
+                    except (TypeError, ValueError, AttributeError):
+                        pass
+                if avail is not None:
+                    return await handle_closed_group(
+                        session, slots, avail,
+                        self._availability, self._impulse
+                    )
 
         logger.error("guardrails failed after %d retries — returning safe fallback", _MAX_RETRIES)
         return self._safe_fallback(phase)
@@ -281,8 +358,9 @@ class ConversationEngine:
         session: Any,
         trace_id: UUID,
         user_text: str = "",
-    ) -> dict[str, str]:
+    ) -> tuple[dict[str, str], dict[str, Any]]:
         results: dict[str, str] = {}
+        availability_cache: dict[str, Any] = {}
         for tc in tool_calls:
             try:
                 if tc.name == "get_filtered_schedule":
@@ -296,13 +374,38 @@ class ConversationEngine:
                     if tc.parameters.get("teacher") and not call_slots.get("teacher"):
                         call_slots["teacher"] = tc.parameters["teacher"]
 
-                    text = await generate_schedule_response(
+                    raw = await generate_schedule_response(
                         self._impulse,
                         call_slots,
                         trace_id,
                         message_text=user_text or tc.parameters.get("message_text", ""),
+                        availability_provider=self._availability,
                     )
+                    if isinstance(raw, str):
+                        text, cache, first_slot = raw, {}, None
+                    elif len(raw) == 2:
+                        text, cache, first_slot = raw[0], raw[1], None
+                    else:
+                        text, cache, first_slot = raw[0], raw[1], raw[2] if len(raw) > 2 else None
                     results[tc.name] = text
+                    if cache:
+                        availability_cache.update(cache)
+
+                    if first_slot and first_slot.get("schedule_id") is not None:
+                        try:
+                            sid = first_slot["schedule_id"]
+                            sdate = first_slot.get("date")
+                            stime = first_slot.get("time")
+                            await update_slots(session, schedule_id=str(sid), schedule_shown=True)
+                            if sdate and stime:
+                                dt_naive = datetime.combine(sdate, stime)
+                                dt_resolved = dt_naive.replace(tzinfo=ZoneInfo("Asia/Vladivostok"))
+                                await update_slots(session, datetime_resolved=dt_resolved)
+                        except Exception as e:
+                            print(f"SCHEDULE_SLOT_EXTRACT_FAILED: {e}")
+                        print(
+                            f"SLOTS_AFTER_SCHEDULE: sid={session.slots.schedule_id} dt={session.slots.datetime_resolved}"
+                        )
 
                 elif tc.name == "start_cancel_flow":
                     text = await get_cancel_flow().start(session, trace_id)
@@ -328,22 +431,92 @@ class ConversationEngine:
                 logger.error("tool_call %s failed: %s", tc.name, exc)
                 results[tc.name] = f"Ошибка при выполнении {tc.name}."
 
-        return results
+        return results, availability_cache
+
+    # -------------------------------------------------------------------------
+    # RFC-005: Availability check before booking
+    # -------------------------------------------------------------------------
+
+    async def _resolve_schedule_id_and_date(
+        self, slots: SlotValues
+    ) -> tuple[int | None, date | None]:
+        """Resolve schedule_id and target_date from slots (mirrors confirm_booking Phase 2)."""
+        sid = slots.schedule_id
+        if sid is not None:
+            try:
+                return int(sid), slots.datetime_resolved.date() if slots.datetime_resolved else None
+            except (TypeError, ValueError):
+                pass
+        if not slots.datetime_resolved:
+            return None, None
+        target_dt = slots.datetime_resolved
+        target_weekday = target_dt.weekday()
+        target_minutes = target_dt.hour * 60 + target_dt.minute
+        group_lower = (slots.group or "").lower()
+        teacher_lower = (getattr(slots, "teacher", None) or "").lower()
+        schedules = await self._impulse.get_schedule()
+        for sch in schedules:
+            if sch.day is None or impulse_day_to_weekday(sch.day) != target_weekday:
+                continue
+            if sch.minutes_begin is None or abs(sch.minutes_begin - target_minutes) > 30:
+                continue
+            if group_lower and group_lower not in (sch.style_name or "").lower():
+                continue
+            if teacher_lower and (not sch.teacher_name or teacher_lower not in sch.teacher_name.lower()):
+                continue
+            return sch.id, target_dt.date()
+        return None, None
+
+    async def _maybe_handle_closed_before_booking(
+        self, session: Any, trace_id: UUID
+    ) -> str | None:
+        """If group is CLOSED/HOLIDAY, run handle_closed_group and return message. Else None."""
+        avail = await check_closed_before_booking(
+            self._availability, session.slots, self._impulse
+        )
+        if avail is None:
+            return None
+        return await handle_closed_group(
+            session, session.slots, avail, self._availability, self._impulse
+        )
 
     # -------------------------------------------------------------------------
     # Helpers
     # -------------------------------------------------------------------------
 
+    def _get_missing_booking_slots(self, slots: SlotValues) -> list[str]:
+        """Return list of missing required booking slots."""
+        required = {
+            "branch": slots.branch,
+            "group": slots.group,
+            "datetime_resolved": slots.datetime_resolved,
+            "client_name": slots.client_name,
+            "client_phone": slots.client_phone,
+        }
+        return [k for k, v in required.items() if not v]
+
     def _build_messages(
         self, system_prompt: str, slots: SlotValues, user_text: str
     ) -> list[dict[str, str]]:
         messages = [{"role": "system", "content": system_prompt}]
-        for msg in slots.messages[-10:]:
+        history = slots.messages[-10:]
+        total_chars = len(system_prompt) + len(user_text)
+        MAX_CHARS = 80000  # ~20k tokens, safe for 32k limit
+        included: list[dict] = []
+        for msg in reversed(history):
+            content = msg.get("content", "")
+            if total_chars + len(content) > MAX_CHARS:
+                print(f"TOKEN_BUDGET_SKIP: dropping msg len={len(content)}, total={total_chars}")
+                continue
+            included.append(msg)
+            total_chars += len(content)
+        for msg in reversed(included):
             role = msg.get("role", "user")
             content = msg.get("content", "")
             if role in ("user", "assistant") and content:
                 messages.append({"role": role, "content": content})
         messages.append({"role": "user", "content": user_text})
+        print(f"BUILD_MESSAGES: {len(messages)} msgs, ~{total_chars} chars")
         return messages
 
     def _parse_llm_response(self, raw_text: str) -> CoreLLMResponse:
@@ -381,6 +554,9 @@ class ConversationEngine:
                     v = datetime.fromisoformat(v)
                 except (ValueError, TypeError):
                     pass
+            # schedule_id must be str in SlotValues
+            if k == "schedule_id" and v is not None:
+                v = str(v)
             filtered[k] = v
         if filtered:
             await update_slots(session, **filtered)
@@ -394,16 +570,80 @@ class ConversationEngine:
         If resolver is not ready (teacher sync failed), skip resolution so LLM flow continues
         without normalization instead of returning "не нашла" for every name.
         """
+        print(f"RESOLVE_ENTRY: resolver={self._resolver is not None} ready={getattr(self._resolver, 'is_ready', 'N/A')} updates={slot_updates}")
         if not self._resolver:
+            print("RESOLVE_EXIT: no resolver")
             return None
         if not getattr(self._resolver, "is_ready", True):
+            print("RESOLVE_EXIT: not ready")
             return None
         teacher_raw = slot_updates.get("teacher_raw") if isinstance(slot_updates.get("teacher_raw"), str) else None
         style_raw = slot_updates.get("style_raw") if isinstance(slot_updates.get("style_raw"), str) else None
         branch_raw = slot_updates.get("branch_raw") if isinstance(slot_updates.get("branch_raw"), str) else None
 
+        # Skip re-resolution of already-confirmed entities (prevents loop when LLM re-sends teacher_raw on branch input)
+        if teacher_raw and session.slots.teacher_id is not None:
+            logger.info(
+                "SKIP_TEACHER_RESOLVE: already set teacher_id=%s teacher=%s, ignoring teacher_raw=%s",
+                session.slots.teacher_id,
+                session.slots.teacher,
+                teacher_raw,
+            )
+            teacher_raw = None
+        if style_raw and session.slots.style_id is not None:
+            logger.info(
+                "SKIP_STYLE_RESOLVE: already set style_id=%s group=%s, ignoring style_raw=%s",
+                session.slots.style_id,
+                session.slots.group,
+                style_raw,
+            )
+            style_raw = None
+        if branch_raw and session.slots.branch_id is not None:
+            logger.info(
+                "SKIP_BRANCH_RESOLVE: already set branch_id=%s branch=%s, ignoring branch_raw=%s",
+                session.slots.branch_id,
+                session.slots.branch,
+                branch_raw,
+            )
+            branch_raw = None
+
+        print(f"RESOLVE_AFTER_GUARDS: teacher_raw={teacher_raw} style_raw={style_raw} branch_raw={branch_raw}")
+        print(f"RESOLVE_CURRENT_SLOTS: teacher_id={session.slots.teacher_id} style_id={session.slots.style_id} branch_id={session.slots.branch_id}")
+
+        # Resolve style first; save immediately so it persists even if teacher needs clarification (Fix D)
+        resolved_style_id: int | str | None = None
+        if style_raw and style_raw.strip():
+            styles = await self._resolver.resolve_style(style_raw.strip(), self._tenant_id)
+            if len(styles) == 1:
+                resolved_style_id = styles[0].crm_id
+                await update_slots(
+                    session,
+                    group=styles[0].name,
+                    style_id=styles[0].crm_id,
+                    style_raw=style_raw.strip(),
+                )
+
         if teacher_raw and teacher_raw.strip():
             teachers = await self._resolver.resolve_teacher(teacher_raw.strip(), self._tenant_id)
+            print(f"RESOLVE_TEACHER: raw={teacher_raw} found={len(teachers)} names={[t.name for t in teachers]}")
+            # Filter by style when user said e.g. "к Насте на heels" (Fix C)
+            if len(teachers) > 1 and resolved_style_id is not None:
+                try:
+                    target_sid = int(resolved_style_id)
+                    groups = await self._impulse.get_groups()
+                    teacher_style_map: dict[int | str, set[int]] = {}
+                    for g in groups:
+                        if g.teacher_id is not None and g.style_id is not None:
+                            teacher_style_map.setdefault(g.teacher_id, set()).add(g.style_id)
+                    filtered = [
+                        t for t in teachers
+                        if target_sid in teacher_style_map.get(t.crm_id, set())
+                    ]
+                    if filtered:
+                        teachers = filtered
+                except Exception:
+                    pass
+
             if len(teachers) > 1:
                 names = [t.name for t in teachers]
                 return f"У нас несколько преподавателей: {', '.join(names)}. К кому записать?"
@@ -417,7 +657,7 @@ class ConversationEngine:
             else:
                 return f"Не нашла преподавателя «{teacher_raw.strip()}». Подсказать, кто ведёт занятия?"
 
-        if style_raw and style_raw.strip():
+        if style_raw and style_raw.strip() and resolved_style_id is None:
             styles = await self._resolver.resolve_style(style_raw.strip(), self._tenant_id)
             if len(styles) > 1:
                 names = [s.name for s in styles]
@@ -433,6 +673,13 @@ class ConversationEngine:
                 return f"Не нашла направление «{style_raw.strip()}». Подсказать, какие есть?"
 
         if branch_raw and branch_raw.strip():
+            logger.info(
+                "SLOTS_BEFORE_BRANCH: teacher=%s teacher_id=%s style=%s style_id=%s",
+                session.slots.teacher,
+                session.slots.teacher_id,
+                session.slots.group,
+                session.slots.style_id,
+            )
             branches = await self._resolver.resolve_branch(branch_raw.strip(), self._tenant_id)
             if len(branches) > 1:
                 names = [b.name for b in branches]
@@ -443,6 +690,13 @@ class ConversationEngine:
                     branch=branches[0].name,
                     branch_id=branches[0].crm_id,
                     branch_raw=branch_raw.strip(),
+                )
+                logger.info(
+                    "SLOTS_AFTER_BRANCH: teacher=%s teacher_id=%s style=%s style_id=%s",
+                    session.slots.teacher,
+                    session.slots.teacher_id,
+                    session.slots.group,
+                    session.slots.style_id,
                 )
             else:
                 unknown = await self._resolver.check_unknown_area(
@@ -456,6 +710,7 @@ class ConversationEngine:
                     return template.format(nearest_branches=nearest_str)
                 return f"Не нашла филиал «{branch_raw.strip()}». Подсказать, какие есть?"
 
+        print("RESOLVE_EXIT: no clarification needed")
         return None
 
     async def _handle_subscription_inquiry(
@@ -479,7 +734,8 @@ class ConversationEngine:
     async def _append_history(self, session: Any, user_text: str, bot_text: str) -> None:
         messages = list(session.slots.messages)
         messages.append({"role": "user", "content": user_text})
-        messages.append({"role": "assistant", "content": bot_text})
+        capped_bot = bot_text[:1500] if len(bot_text) > 1500 else bot_text
+        messages.append({"role": "assistant", "content": capped_bot})
         # Keep last _HISTORY_KEEP messages to bound storage size
         messages = messages[-_HISTORY_KEEP:]
         await update_slots(session, messages=messages)
@@ -559,6 +815,18 @@ def set_entity_resolver(resolver: EntityResolver | None) -> None:
 def get_entity_resolver() -> EntityResolver | None:
     """Return current global EntityResolver (for resync job)."""
     return _entity_resolver
+
+
+def set_availability_provider(provider: Any) -> None:
+    """Set availability provider on the global engine (RFC-005, called from main.py)."""
+    engine = get_conversation_engine()
+    engine._availability = provider
+
+
+def get_availability_provider() -> Any:
+    """Return current availability provider (RFC-005, for tests/resync)."""
+    engine = get_conversation_engine()
+    return engine._availability
 
 
 @lru_cache()

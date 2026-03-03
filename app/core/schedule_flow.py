@@ -1,16 +1,35 @@
 """Schedule fetching and formatting.
 
 Deterministic schedule display — no LLM calls (CONTRACT §6, no hallucination).
+RFC-005: availability markers when provider is set.
 """
 
+import logging
 import re
 import time
 from collections import defaultdict
-from datetime import date
+from datetime import date, datetime, timedelta
 from typing import Any
 from uuid import UUID
+from zoneinfo import ZoneInfo
 
+from app.core.availability.protocol import AvailabilityStatus
+from app.core.availability.schedule_expander import expand_schedule
+from app.integrations.impulse.models import impulse_day_to_weekday
 from app.storage.postgres import postgres_storage
+
+logger = logging.getLogger(__name__)
+_STUDIO_TZ = ZoneInfo("Asia/Vladivostok")
+
+_MONTH_RU = ("янв", "фев", "мар", "апр", "мая", "июн", "июл", "авг", "сен", "окт", "ноя", "дек")
+
+_AVAILABILITY_MARKERS = {
+    AvailabilityStatus.OPEN: "✅",
+    AvailabilityStatus.CLOSED: "❌ ЗАКРЫТО",
+    AvailabilityStatus.PRIORITY: "⭐ НОВАЯ ХОРЕОГРАФИЯ",
+    AvailabilityStatus.HOLIDAY: "🚫 ВЫХОДНОЙ",
+    AvailabilityStatus.INFO: "",
+}
 
 DAYS_RU = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
 
@@ -150,6 +169,22 @@ def build_schedule_groups(
     return result
 
 
+def _teacher_name_matches(filter_str: str | None, full_name: str | None) -> bool:
+    """True if filter matches full name (exact substring or diminutive stem, e.g. Настя → Анастасия)."""
+    if not filter_str or not full_name:
+        return bool(not filter_str)
+    fl = filter_str.strip().lower()
+    nl = (full_name or "").strip().lower()
+    if fl in nl:
+        return True
+    # Diminutive vs full name: "настя" vs "анастасия" — stem of 3–4 chars often matches
+    if len(fl) >= 3 and fl[:3] in nl:
+        return True
+    if len(fl) >= 4 and fl[:4] in nl:
+        return True
+    return False
+
+
 def format_schedule(
     schedules: list,
     group_filter: str | None = None,
@@ -165,7 +200,7 @@ def format_schedule(
     groups = build_schedule_groups(schedules, group_filter=group_filter)
 
     if teacher_filter:
-        groups = [g for g in groups if teacher_filter in (g["teacher"] or "").lower()]
+        groups = [g for g in groups if _teacher_name_matches(teacher_filter, g.get("teacher"))]
 
     if not groups:
         return "На ближайшие дни занятий не найдено. Уточните у администратора."
@@ -178,11 +213,113 @@ def format_schedule(
         header = f"Расписание {group_filter}:" if group_filter else "Актуальное расписание:"
     lines = [header, ""]
     for idx, g in enumerate(groups, start=1):
-        days_str = ", ".join(DAYS_RU[d] for d in g["days"] if 0 <= d <= 6)
+        days_str = ", ".join(
+            DAYS_RU[impulse_day_to_weekday(d)] for d in g["days"] if 1 <= d <= 7
+        )
         style_part = f" ({g.get('style', '')})" if teacher_filter and g.get("style") else ""
         lines.append(f"{idx}. {g['teacher']}{style_part} — {days_str}, {g['time_str']}")
 
     return "\n".join(lines)
+
+
+async def _format_schedule_with_availability(
+    schedules: list,
+    slots: dict[str, Any],
+    availability_provider: Any,
+    group_filter: str | None,
+    teacher_filter: str | None,
+    message_text: str,
+    pre_filtered: bool = False,
+) -> tuple[str, dict[str, Any]]:
+    """Format schedule with concrete dates and availability markers (RFC-005 §7.2).
+
+    Returns:
+        (formatted_text, availability_cache). Cache key: f"{schedule_id}:{date}".
+        availability_cache is used by G14 guardrail to block booking on CLOSED/HOLIDAY groups.
+    When pre_filtered=True, skips group_filter string matching (schedules already filtered by
+    style_id/branch_id/teacher_id; KB name != CRM name e.g. "High Heels" vs "Хай хиллс").
+    """
+    from app.core.availability.protocol import GroupAvailability
+
+    if not pre_filtered:
+        group_filter = _resolve_group_filter(schedules, group_filter, message_text)
+        filtered = [
+            s for s in schedules
+            if hasattr(s, "style_name") and (
+                group_filter is None or s.style_name.lower() == (group_filter or "").lower()
+            )
+        ]
+    else:
+        filtered = list(schedules)
+    if teacher_filter:
+        filtered = [s for s in filtered if _teacher_name_matches(teacher_filter, getattr(s, "teacher_name", None))]
+    if not filtered:
+        return "На ближайшие дни занятий не найдено. Уточните у администратора.", {}, None
+
+    from_date = datetime.now(_STUDIO_TZ).date()
+    to_date = from_date + timedelta(days=14)
+    expanded = expand_schedule(filtered, from_date, to_date)
+
+    # Debug: verify expanded schedule matches CRM templates (Impulse day 0=Mon?)
+    for tmpl in filtered[:5]:
+        logger.info(
+            "CRM_TEMPLATE: schedule_id=%s day=%s (0=Mon) minutes_begin=%s style=%s teacher=%s",
+            getattr(tmpl, "id", None),
+            getattr(tmpl, "day", None),
+            getattr(tmpl, "minutes_begin", None),
+            getattr(tmpl, "style_name", None),
+            getattr(tmpl, "teacher_name", None),
+        )
+    for slot in expanded[:5]:
+        logger.info(
+            "EXPANDED: schedule_id=%s date=%s weekday=%s time=%s group=%s teacher=%s",
+            slot.schedule_id,
+            slot.date,
+            slot.date.weekday(),
+            slot.time_begin,
+            slot.group_name,
+            slot.teacher_name,
+        )
+
+    lines: list[str] = []
+    cache: dict[str, GroupAvailability] = {}
+    header = f"Расписание {group_filter}:" if group_filter else "Актуальное расписание:"
+    if teacher_filter:
+        header = f"Расписание {teacher_filter}:"
+    lines.append(header)
+    lines.append("")
+
+    crm_available = True
+    for slot in expanded:
+        if not crm_available:
+            marker = "✅"
+        else:
+            try:
+                avail = await availability_provider.get_availability(slot.schedule_id, slot.date)
+                cache[f"{slot.schedule_id}:{slot.date.isoformat()}"] = avail
+                marker = _AVAILABILITY_MARKERS.get(avail.status, "✅")
+            except Exception as e:
+                logger.warning("availability_fetch_failed slot=%s: %s", slot.schedule_id, e)
+                crm_available = False
+                marker = "✅"
+        day_short = DAYS_RU[slot.date.weekday()] if 0 <= slot.date.weekday() <= 6 else "?"
+        date_str = f"{slot.date.day} {_MONTH_RU[slot.date.month - 1]}"
+        time_str = slot.time_begin.strftime("%H:%M") if hasattr(slot.time_begin, "strftime") else "?"
+        group_name = slot.group_name or "?"
+        teacher_name = slot.teacher_name or "—"
+        branch_name = slot.branch_name or "—"
+        marker_part = f" | {marker}" if marker else ""
+        lines.append(f"{day_short} {date_str} {time_str} | {group_name} | {teacher_name} | {branch_name}{marker_part}")
+
+    first_slot: dict[str, Any] | None = None
+    if expanded:
+        first = expanded[0]
+        first_slot = {
+            "schedule_id": first.schedule_id,
+            "date": first.date,
+            "time": first.time_begin,
+        }
+    return "\n".join(lines), cache, first_slot
 
 
 async def generate_schedule_response(
@@ -190,7 +327,8 @@ async def generate_schedule_response(
     slots: dict[str, Any],
     trace_id: UUID,
     message_text: str = "",
-) -> str:
+    availability_provider: Any = None,
+) -> tuple[str, dict[str, Any]]:
     """Fetch from CRM and return formatted schedule string. No LLM.
 
     Args:
@@ -198,13 +336,17 @@ async def generate_schedule_response(
         slots: Current booking slots dict (may contain "group", "datetime").
         trace_id: Trace ID for logging.
         message_text: Raw user message text (str) for style detection fallback.
-                      Pass message.text at call sites — this module never imports UnifiedMessage.
+        availability_provider: Optional. When set, shows concrete dates with ✅/❌/⭐ markers.
+
+    Returns:
+        (formatted_text, availability_cache). Cache key: f"{schedule_id}:{date}".
+        Empty dict when no availability_provider.
     """
     schedules = await fetch_schedule(impulse_adapter, slots, trace_id)
     if isinstance(schedules, dict) and "error" in schedules:
-        return "Не удалось получить расписание. Попробуйте позже или свяжитесь с администратором."
+        return "Не удалось получить расписание. Попробуйте позже или свяжитесь с администратором.", {}, None
     if not schedules:
-        return "На ближайшие дни занятий не найдено. Уточните у администратора."
+        return "На ближайшие дни занятий не найдено. Уточните у администратора.", {}, None
 
     # Filter by branch_id when present (RFC-004), else by branch name
     branch_id = slots.get("branch_id")
@@ -244,14 +386,32 @@ async def generate_schedule_response(
             and str((s.group or {}).get("teacher1", {}).get("id")) == tid
         ]
     if not schedules:
-        return "На ближайшие дни занятий не найдено. Уточните у администратора."
+        return "На ближайшие дни занятий не найдено. Уточните у администратора.", {}, None
 
-    return format_schedule(
+    was_filtered = slots.get("style_id") is not None or slots.get("teacher_id") is not None
+
+    if availability_provider is not None:
+        try:
+            text, cache, first_slot = await _format_schedule_with_availability(
+                schedules,
+                slots,
+                availability_provider,
+                group_filter=slots.get("group"),
+                teacher_filter=slots.get("teacher"),
+                message_text=message_text,
+                pre_filtered=was_filtered,
+            )
+            return text, cache, first_slot
+        except Exception as e:
+            logger.warning("schedule_with_availability failed, falling back: %s", e)
+
+    text = format_schedule(
         schedules,
-        group_filter=slots.get("group"),
+        group_filter=slots.get("group") if not was_filtered else None,
         message_text=message_text,
         teacher_filter=slots.get("teacher"),
     )
+    return text, {}, None
 
 
 def parse_schedule_choice(text: str, groups: list[dict]) -> dict | None:

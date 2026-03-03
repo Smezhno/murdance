@@ -1,0 +1,70 @@
+# Prompt regression: Availability (RFC-005 §7)
+# Scenarios: closed group handling, PRIORITY treated as open, schedule markers,
+# alternative date offer, escalation when all closed.
+#
+# Context injection (availability state per schedule/date) requires CRM mock wiring.
+# Tests run against real engine + availability provider — pass depends on CRM sticker state.
+
+name: "Availability Tests"
+description: "RFC-005: closed group block, alternatives, markers, escalation"
+
+tests:
+  - name: "booking_closed_group"
+    user: "Запиши меня на стрип к Насте на пятницу"
+    expected:
+      contains_one_of:
+        - "закрыт"
+        - "закрыта"
+        - "ближайшая"
+        - "альтернатив"
+      not_contains:
+        - "записала"
+        - "подтверждаю"
+    skip: true
+    skip_reason: "availability mock (CLOSED per schedule/date) not wired"
+
+  - name: "booking_open_with_priority"
+    user: "Хочу на хилс в среду"
+    expected:
+      not_contains:
+        - "ошибка"
+        - "закрыт"
+        - "нельзя"
+    # PRIORITY = open, proceeds normally. No skip — works if CRM has any Wed slot.
+
+  - name: "schedule_shows_markers"
+    user: "Какое расписание на эту неделю?"
+    expected:
+      contains_one_of:
+        - "✅"
+        - "❌"
+        - "⭐"
+        - "расписан"
+      not_contains:
+        - "ошибка"
+
+  - name: "closed_with_alternative_offered"
+    user: "Запиши на фрейм ап стрип в пятницу"
+    expected:
+      contains_one_of:
+        - "закрыт"
+        - "закрыта"
+        - "ближайшая"
+        - "подойдёт"
+      not_contains:
+        - "записала"
+    skip: true
+    skip_reason: "availability mock (Friday CLOSED, next OPEN) not wired"
+
+  - name: "all_closed_escalation"
+    user: "Хочу на стрип-пластику"
+    expected:
+      contains_one_of:
+        - "закрыт"
+        - "администратор"
+        - "лист ожидания"
+        - "передать"
+      not_contains:
+        - "записала"
+    skip: true
+    skip_reason: "availability mock (all CLOSED 4 weeks) not wired"

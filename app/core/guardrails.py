@@ -12,6 +12,7 @@ from zoneinfo import ZoneInfo
 
 from pydantic import BaseModel
 
+from app.core.availability.protocol import AvailabilityStatus, GroupAvailability
 from app.core.prompt_builder import LLMResponse, ToolCall
 from app.core.slot_tracker import ConversationPhase
 from app.knowledge.base import KnowledgeBase
@@ -63,6 +64,7 @@ class GuardrailRunner:
         phase: ConversationPhase,
         crm_schedule: list | None = None,
         executed_tools: set[str] | None = None,
+        availability_cache: dict[str, GroupAvailability] | None = None,
     ) -> GuardrailResult:
         violations: list[str] = []
         message = llm_response.message
@@ -88,6 +90,7 @@ class GuardrailRunner:
         violations += self._g10_schedule_id_exists(tool_map, crm_schedule)
         violations += self._g11_datetime_in_future(llm_response)
         violations += self._g13_intent_context(llm_response)
+        violations += self._g14_closed_group_booking(llm_response, slots, availability_cache)
 
         # --- Auto-fixes (applied after hard checks) ---
         corrected = self._g7_truncate(message)
@@ -255,6 +258,45 @@ class GuardrailRunner:
                 return [f"G11: datetime {dt_value!r} is not in the future"]
         except (ValueError, TypeError):
             return [f"G11: could not parse datetime {dt_value!r}"]
+        return []
+
+    # -------------------------------------------------------------------------
+    # G14 — Block booking for closed groups (RFC-005 §7.4)
+    # -------------------------------------------------------------------------
+
+    def _g14_closed_group_booking(
+        self,
+        llm_response: LLMResponse,
+        slots: SlotValues,
+        availability_cache: dict[str, GroupAvailability] | None,
+    ) -> list[str]:
+        """Block create_booking when availability_cache says group is CLOSED/HOLIDAY."""
+        # Engine converts create_booking to intent="booking"; check both for robustness
+        has_create_booking = any(tc.name == "create_booking" for tc in llm_response.tool_calls)
+        is_booking_intent = llm_response.intent == "booking"
+        if not (has_create_booking or is_booking_intent):
+            return []
+        if not availability_cache:
+            return []
+
+        schedule_id = slots.schedule_id
+        dt_resolved = slots.datetime_resolved
+        if schedule_id is None or dt_resolved is None:
+            return []
+        try:
+            sid = int(schedule_id)
+        except (TypeError, ValueError):
+            return []
+        target_date = dt_resolved.date() if hasattr(dt_resolved, "date") else None
+        if target_date is None:
+            return []
+        cache_key = f"{sid}:{target_date.isoformat()}"
+        avail = availability_cache.get(cache_key)
+        if avail is None:
+            return []
+        if avail.status in (AvailabilityStatus.CLOSED, AvailabilityStatus.HOLIDAY):
+            sticker = avail.sticker_text or avail.status.value
+            return [f"G14: booking blocked — group closed ({sticker})"]
         return []
 
     # -------------------------------------------------------------------------

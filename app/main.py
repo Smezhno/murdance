@@ -16,11 +16,32 @@ from app.queue.outbound import enqueue_message
 from app.storage.postgres import postgres_storage
 
 
+def _wire_availability_provider(kb, impulse) -> None:
+    """Wire ImpulseStickerProvider at startup (RFC-005 §5.4.4)."""
+    if not getattr(kb, "availability", None) or not getattr(kb.availability, "sticker_mapping", None):
+        return
+    try:
+        from app.core.availability.impulse_provider import ImpulseStickerProvider
+        from app.core.engine import set_availability_provider
+
+        provider = ImpulseStickerProvider(
+            adapter=impulse,
+            config=kb.availability.sticker_mapping,
+        )
+        set_availability_provider(provider)
+    except Exception:
+        import logging
+
+        logging.getLogger(__name__).warning(
+            "Availability provider (RFC-005) creation failed — continuing without it",
+            exc_info=True,
+        )
+
+
 async def _resync_teachers() -> None:
     """Periodic teacher sync for EntityResolver (RFC-004 §4.3, every 6h)."""
     from app.core.engine import get_entity_resolver
     from app.integrations.impulse import get_impulse_adapter
-
     resolver = get_entity_resolver()
     if resolver is None or not getattr(resolver, "_teacher", None):
         return
@@ -81,6 +102,9 @@ async def lifespan(app: FastAPI):
         replace_existing=True,
         misfire_grace_time=600,
     )
+
+    # ImpulseStickerProvider for RFC-005 group availability (sticker-based)
+    _wire_availability_provider(kb, impulse)
 
     yield
 

@@ -2,18 +2,23 @@
 
 Per CONTRACT §5: get_schedule, get_groups, find_client, create_client,
 create_booking, list_bookings, cancel_booking, health_check.
+RFC-005: get_additions for schedule/addition (sticker additions).
 """
 
+import logging
 from functools import lru_cache
-from datetime import date, datetime
+from datetime import date, datetime, time as dt_time, timedelta
 from typing import Any
 from uuid import UUID
+from zoneinfo import ZoneInfo
 
 from app.integrations.impulse.cache import get_impulse_cache
 from app.integrations.impulse.client import get_impulse_client
 from app.integrations.impulse.error_handler import ImpulseErrorHandler
 from app.integrations.impulse.fallback import get_fallback
 from app.integrations.impulse.models import Client, Group, Reservation, Schedule
+
+logger = logging.getLogger(__name__)
 
 
 class ImpulseAdapter:
@@ -52,12 +57,25 @@ class ImpulseAdapter:
             if cached is not None:
                 return [Schedule(**item) for item in cached]
 
-            # Fetch from CRM — no field filter, get full objects
+            # Fetch from CRM — only fields we use (avoids huge nested payloads)
             data = await self.client.list(
                 "schedule",
+                fields=["id", "regular", "day", "minutesBegin", "minutesEnd", "dateBegin", "group", "branch", "sticker"],
                 filters=None,
                 limit=1000,
             )
+
+            # === TEMP DEBUG: check if stickers come with schedule ===
+            for item in data[:10]:
+                sticker = item.get("sticker")
+                if sticker:
+                    logger.info(
+                        "SCHEDULE_HAS_STICKER: schedule_id=%s sticker=%s",
+                        item.get("id"), sticker,
+                    )
+            sticker_count = sum(1 for item in data if item.get("sticker"))
+            logger.info("SCHEDULE_STICKER_COUNT: %d/%d have stickers", sticker_count, len(data))
+            # === END TEMP DEBUG ===
 
             # Parse schedules — no branch filter; consultation uses all branches
             schedules = [Schedule(**item) for item in data]
@@ -73,6 +91,57 @@ class ImpulseAdapter:
                     {"date_from": str(date_from) if date_from else None, "date_to": str(date_to) if date_to else None, "group_id": group_id},
                     str(e),
                 )
+            raise RuntimeError(user_msg) from e
+
+    async def get_teacher_list(self) -> list[dict[str, Any]]:
+        """Get list of teachers for EntityResolver sync (RFC-004 §4.3).
+
+        Returns list of dicts with "id" and "name", e.g. [{"id": 1, "name": "Анастасия Николаева"}].
+        Tries CRM teacher entity first; fallback: unique teachers from schedule (group.teacher1).
+        """
+        try:
+            cached = await self.cache.get("teachers")
+            if cached is not None:
+                return list(cached)
+
+            try:
+                data = await self.client.list(
+                    "teacher",
+                    fields=["id", "name", "lastName", "middleName"],
+                    limit=500,
+                )
+                items = []
+                for item in data:
+                    tid = item.get("id")
+                    first = (item.get("name") or "").strip()
+                    last = (item.get("lastName") or "").strip()
+                    if tid is not None and first:
+                        items.append({"id": tid, "name": first, "lastName": last})
+            except Exception:
+                # Fallback: derive from schedule (group.teacher1)
+                schedules = await self.get_schedule()
+                seen: dict[int, tuple[str, str]] = {}
+                for sch in schedules:
+                    if not getattr(sch, "group", None):
+                        continue
+                    t1 = (sch.group or {}).get("teacher1") if isinstance(sch.group, dict) else None
+                    if not t1 or not isinstance(t1, dict):
+                        continue
+                    tid = t1.get("id")
+                    first = (t1.get("name") or "").strip()
+                    last = (t1.get("lastName") or "").strip()
+                    if tid is not None and first and tid not in seen:
+                        seen[tid] = (first, last)
+                items = [{"id": k, "name": v[0], "lastName": v[1]} for k, v in seen.items()]
+
+            out = [x for x in items if x.get("id") is not None and (x.get("name") or "").strip()]
+            await self.cache.set("teachers", out)
+            return out
+
+        except Exception as e:
+            user_msg, should_fallback = self.error_handler.handle_error(e)
+            if should_fallback:
+                await self.fallback.enqueue("get_teacher_list", {}, str(e))
             raise RuntimeError(user_msg) from e
 
     async def get_groups(self) -> list[Group]:
@@ -140,6 +209,82 @@ class ImpulseAdapter:
             user_msg, should_fallback = self.error_handler.handle_error(e)
             if should_fallback:
                 await self.fallback.enqueue("find_client", {"phone": phone}, str(e))
+            raise RuntimeError(user_msg) from e
+
+    async def get_additions(self, target_date: date) -> list[dict[str, Any]]:
+        """Fetch schedule additions (stickers) for a specific date (RFC-005 §4.2).
+
+        schedule/addition is NOT a list endpoint — it expects simple {"date": unix_ts}.
+        POST /api/public/schedule/addition. Caches under schedule, key additions:YYYY-MM-DD, TTL 15 min.
+        Returns raw items list from API response (each item: id, name, date, schedule, branch, ...).
+        """
+        try:
+            cache_key = ("additions", target_date.isoformat())
+            cached = await self.cache.get("schedule", *cache_key)
+            if cached is not None:
+                return list(cached)
+
+            tz = ZoneInfo("Asia/Vladivostok")
+            day_start = datetime(
+                target_date.year, target_date.month, target_date.day, tzinfo=tz
+            )
+            ts = int(day_start.timestamp())
+
+            # Simple format — schedule/addition is NOT a list endpoint
+            body = {"date": ts}
+
+            response = await self.client._request("POST", "schedule", "addition", body)
+            data = response.json()
+            items = data.get("items", [])
+
+            await self.cache.set("schedule", items, *cache_key)
+            return items
+
+        except Exception as e:
+            # Unwrap RetryError → get actual HTTP error
+            actual_error = e
+            try:
+                import tenacity
+                if isinstance(e, tenacity.RetryError):
+                    # e.last_attempt can be a concurrent.futures.Future
+                    future = getattr(e, "last_attempt", None)
+                    if future is not None:
+                        inner = future.exception()
+                        if inner is not None:
+                            actual_error = inner
+            except Exception:
+                pass  # If unwrap fails, log the original
+
+            if hasattr(actual_error, "response"):
+                logger.error(
+                    "GET_ADDITIONS_FAILED: status=%d url=%s body=%.500s",
+                    actual_error.response.status_code,
+                    str(actual_error.request.url),
+                    (actual_error.response.text or "")[:500],
+                )
+            else:
+                logger.error(
+                    "GET_ADDITIONS_FAILED: type=%s msg=%s",
+                    type(actual_error).__name__,
+                    str(actual_error)[:500],
+                )
+                # Fallback: try exception chain (__cause__ / __context__)
+                cause = getattr(e, "__cause__", None) or getattr(e, "__context__", None)
+                if cause is not None and hasattr(cause, "response"):
+                    logger.error(
+                        "GET_ADDITIONS_CAUSED_BY: status=%d url=%s body=%.500s",
+                        cause.response.status_code,
+                        str(cause.request.url),
+                        (cause.response.text or "")[:500],
+                    )
+
+            user_msg, should_fallback = self.error_handler.handle_error(e)
+            if should_fallback:
+                await self.fallback.enqueue(
+                    "get_additions",
+                    {"target_date": target_date.isoformat()},
+                    str(e),
+                )
             raise RuntimeError(user_msg) from e
 
     async def create_client(self, name: str, phone: str, informer_id: int | None = None, trace_id: UUID | None = None) -> Client:

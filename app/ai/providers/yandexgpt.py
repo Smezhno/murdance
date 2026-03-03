@@ -3,11 +3,14 @@
 Primary LLM provider per economics decision.
 """
 
+import logging
 import time
 from functools import lru_cache
 from typing import Any
 
 import httpx
+
+logger = logging.getLogger(__name__)
 
 from app.ai.providers.base import LLMProvider, LLMResponse
 from app.config import get_settings
@@ -82,16 +85,24 @@ class YandexGPTProvider:
 
         # Make API call with persistent client
         client = await self._get_client()
-        response = await client.post(
-            self.base_url,
-            json=payload,
-            headers={
-                "Authorization": f"Api-Key {self.api_key}",
-                "Content-Type": "application/json",
-                "x-folder-id": self.folder_id,
-            },
-        )
-        response.raise_for_status()
+        try:
+            response = await client.post(
+                self.base_url,
+                json=payload,
+                headers={
+                    "Authorization": f"Api-Key {self.api_key}",
+                    "Content-Type": "application/json",
+                    "x-folder-id": self.folder_id,
+                },
+            )
+            response.raise_for_status()
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code == 400:
+                logger.error(
+                    "LLM_400_BODY: %.1000s",
+                    (e.response.text or "")[:1000],
+                )
+            raise
         data = response.json()
 
         # Parse response

@@ -8,7 +8,7 @@ import logging
 import re
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 from zoneinfo import ZoneInfo
 
 logger = logging.getLogger(__name__)
@@ -233,6 +233,28 @@ class Escalation(BaseModel):
     triggers: list[str] = Field(..., description="Trigger phrases for escalation")
 
 
+# === RFC-005 Group Availability (sticker mapping) ===
+class StickerMapping(BaseModel):
+    """Keywords to classify CRM stickers into availability status (RFC-005 §8)."""
+
+    open_keywords: list[str] = Field(default_factory=list, description="Sticker names → OPEN")
+    closed_keywords: list[str] = Field(default_factory=list, description="Sticker names → CLOSED")
+    priority_keywords: list[str] = Field(default_factory=list, description="Sticker names → PRIORITY")
+    holiday_keywords: list[str] = Field(default_factory=list, description="Sticker names → HOLIDAY")
+    info_keywords: list[str] = Field(default_factory=list, description="Sticker names → INFO")
+    unknown_action: Literal["open", "closed"] = Field(
+        default="open",
+        description="Default when sticker name matches no keyword",
+    )
+
+
+class AvailabilityConfig(BaseModel):
+    """Availability section (RFC-005 §8). Missing section → defaults: empty lists, unknown_action=open."""
+
+    sticker_mapping: StickerMapping = Field(default_factory=StickerMapping)
+    max_lookahead_weeks: int = Field(default=4, description="Max weeks to search for next open slot")
+
+
 class KnowledgeBase(BaseModel):
     """Knowledge base schema v1.0 (CONTRACT §15)."""
 
@@ -275,6 +297,12 @@ class KnowledgeBase(BaseModel):
     unknown_areas: dict[str, Any] = Field(
         default_factory=dict,
         description="Unknown area aliases and nearest_branches (RFC-004 §4.4)",
+    )
+
+    # === RFC-005 Group Availability ===
+    availability: AvailabilityConfig = Field(
+        default_factory=AvailabilityConfig,
+        description="Sticker mapping and lookahead (RFC-005 §8). Missing in YAML → defaults.",
     )
 
     @field_validator("schema_version")

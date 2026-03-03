@@ -153,7 +153,8 @@ class TestRunner:
         # Skipped tests are excluded from totals so they don't drag down pass rate
         for t in all_tests:
             if t.get("skip"):
-                print(f"  SKIP: {t.get('name', 'unnamed')} (crm_mock not wired)")
+                reason = t.get("skip_reason", "requires mock wiring")
+                print(f"  SKIP: {t.get('name', 'unnamed')} ({reason})")
         active_tests = [t for t in all_tests if not t.get("skip")]
 
         results = {

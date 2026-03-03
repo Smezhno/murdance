@@ -22,18 +22,23 @@ def _add(lookup: dict[str, list[ResolvedEntity]], key: str, entry: ResolvedEntit
 
 
 def _build_lookup(kb: _KbLike) -> dict[str, list[ResolvedEntity]]:
-    """Build alias → list[ResolvedEntity] from style_aliases."""
+    """Build alias → list[ResolvedEntity] from style_aliases + services[].aliases merge."""
     lookup: dict[str, list[ResolvedEntity]] = {}
     aliases = getattr(kb, "style_aliases", None) or {}
     if not isinstance(aliases, dict):
         return lookup
+    services = getattr(kb, "services", None) or []
     for style_name, data in aliases.items():
         if not isinstance(data, dict):
             continue
         crm_id = data.get("crm_style_id") or data.get("crm_id")
-        alias_list = data.get("aliases") or []
         if crm_id is None:
             continue
+        alias_list = list(data.get("aliases") or [])
+        for svc in services:
+            if getattr(svc, "name", None) == style_name:
+                alias_list.extend(getattr(svc, "aliases", []) or [])
+                break
         entry = ResolvedEntity(
             name=str(style_name),
             crm_id=crm_id,
@@ -41,6 +46,9 @@ def _build_lookup(kb: _KbLike) -> dict[str, list[ResolvedEntity]]:
             confidence=1.0,
             source="alias",
         )
+        canonical_key = str(style_name).strip().lower()
+        if canonical_key:
+            _add(lookup, canonical_key, entry)
         for a in alias_list:
             if isinstance(a, str):
                 key = a.strip().lower()

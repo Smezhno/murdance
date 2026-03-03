@@ -8,6 +8,7 @@ from typing import Any
 from uuid import UUID
 
 from app.core.conversation import transition_state
+from app.integrations.impulse.models import impulse_day_to_weekday
 from app.core.idempotency import acquire_booking_lock, release_booking_lock
 from app.core.response_generator import generate_response, get_booking_restricted_message
 from app.models import ConversationState
@@ -135,7 +136,7 @@ async def confirm_booking(
 
             schedules = await impulse_adapter.get_schedule()
             for sch in schedules:
-                if sch.day != target_weekday:
+                if sch.day is None or impulse_day_to_weekday(sch.day) != target_weekday:
                     continue
                 if sch.minutes_begin is None or abs(sch.minutes_begin - target_minutes) > 30:
                     continue

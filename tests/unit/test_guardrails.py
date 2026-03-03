@@ -45,9 +45,14 @@ def kb() -> KnowledgeBase:
         ],
         escalation={"triggers": ["жалоба"]},
         branches=[
-            {"id": "semenovskaya", "name": "Семёновская",
-             "address": "Семёновская 30а (стеклянное здание, крайняя дверь справа)",
-             "styles": ["high-heels"]},
+            {
+                "id": "semenovskaya",
+                "name": "Семёновская",
+                "crm_branch_id": "ZZ",
+                "address": "Семёновская 30а (стеклянное здание, крайняя дверь справа)",
+                "styles": ["high-heels"],
+                "aliases": ["семёновская", "семеновская"],
+            },
         ],
         dress_code={
             "high-heels": "носочки либо каблуки со светлой подошвой",
@@ -180,7 +185,8 @@ class TestG3:
     async def test_missing_phone_blocks(self, runner):
         slots = SlotValues(group="High Heels", client_name="Маша",
                            datetime_resolved=_future_dt())
-        r = await runner.check(_resp(intent="booking"), slots, ConversationPhase.CONFIRMATION)
+        tc = ToolCall(name="create_booking", parameters={"schedule_id": "42"})
+        r = await runner.check(_resp(intent="booking", tool_calls=[tc]), slots, ConversationPhase.CONFIRMATION)
         assert any("G3" in v for v in r.violations)
 
     @pytest.mark.asyncio

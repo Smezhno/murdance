@@ -4,8 +4,12 @@ Per CONTRACT §5: CRM errors → user-friendly message + fallback queue.
 Per RFC §9.4: Error handling table.
 """
 
-import httpx
+import logging
 from typing import Any
+
+import httpx
+
+logger = logging.getLogger(__name__)
 
 
 class ImpulseErrorHandler:
@@ -22,6 +26,38 @@ class ImpulseErrorHandler:
             Tuple of (user_message, should_fallback)
             should_fallback is True if error should go to fallback queue
         """
+        # Unwrap tenacity RetryError to get actual exception
+        try:
+            import tenacity
+            if isinstance(error, tenacity.RetryError):
+                last = getattr(error, "last_attempt", None)
+                if last is not None:
+                    outcome = getattr(last, "outcome", None)
+                    if outcome is not None and not getattr(outcome, "cancelled", lambda: False)():
+                        try:
+                            inner = outcome.exception()
+                        except Exception:
+                            inner = None
+                        else:
+                            if inner is not None:
+                                logger.warning(
+                                    "unwrapped_retry_error original=%s inner=%s",
+                                    type(error).__name__,
+                                    type(inner).__name__,
+                                )
+                                error = inner
+        except ImportError:
+            pass
+
+        # Log HTTP details when available
+        if isinstance(error, httpx.HTTPStatusError):
+            logger.error(
+                "crm_http_error status=%d url=%s body=%.500s",
+                error.response.status_code,
+                str(error.request.url),
+                (error.response.text or "")[:500],
+            )
+
         # HTTP status errors
         if isinstance(error, httpx.HTTPStatusError):
             status = error.response.status_code

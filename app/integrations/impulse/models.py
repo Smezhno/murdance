@@ -4,6 +4,18 @@ Per CONTRACT §5: Strict validation for schedule, reservation, client, group.
 """
 
 from datetime import datetime
+
+
+def impulse_day_to_weekday(day: int) -> int:
+    """Impulse day (1=Mon..7=Sun) to Python weekday (0=Mon..6=Sun).
+
+    Raises ValueError if day not in 1-7 range.
+    """
+    if not 1 <= day <= 7:
+        raise ValueError(f"Invalid Impulse day: {day}, expected 1-7")
+    return day - 1
+
+
 from typing import Any
 
 from pydantic import BaseModel, Field, field_validator
@@ -31,7 +43,7 @@ class Schedule(BaseModel):
     model_config = {"extra": "ignore", "populate_by_name": True}
 
     id: int = Field(..., description="Schedule ID")
-    day: int | None = Field(None, description="Day of week (0=Mon, 6=Sun)")
+    day: int | None = Field(None, description="Day of week (1=Mon, 2=Tue, ..., 5=Fri, 6=Sat, 7=Sun, Impulse CRM convention)")
     minutes_begin: int | None = Field(None, alias="minutesBegin", description="Start time in minutes from midnight")
     minutes_end: int | None = Field(None, alias="minutesEnd", description="End time in minutes from midnight")
     date_begin: int | None = Field(None, alias="dateBegin", description="Unix timestamp for one-time classes")
@@ -103,10 +115,16 @@ class Schedule(BaseModel):
 
 
 class Group(BaseModel):
-    """Group model (CONTRACT §5)."""
+    """Group model (CONTRACT §5).
+
+    CRM may return groups without name (e.g. {"id": 27, "description": None}).
+    name/style_id/teacher_id optional to avoid ValidationError on partial responses.
+    """
+
+    model_config = {"extra": "ignore"}
 
     id: int = Field(..., description="Group ID")
-    name: str = Field(..., description="Group name")
+    name: str | None = Field(None, description="Group name (CRM sometimes omits)")
     style_id: int | None = Field(None, description="Style ID")
     teacher_id: int | None = Field(None, description="Teacher ID")
     description: str | None = Field(None, description="Group description")

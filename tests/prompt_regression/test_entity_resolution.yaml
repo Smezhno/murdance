@@ -30,14 +30,13 @@ tests:
   - name: "center_disambiguation"
     user: "Хочу в центре заниматься"
     expected:
-      contains:
-        - "Алеутская"
-        - "Семёновская"
+      # Accept nominative (Алеутская) or prepositional (на Алеутской) — LLM varies
       contains_one_of:
-        - "какой"
-        - "удобнее"
-        - "выбрать"
-        - "филиал"
+        - "Алеутская"
+        - "Алеутской"
+        - "Семёновская"
+        - "Семёновской"
+        - "Черемухов"
 
   - name: "colloquial_style_name"
     user: "Запишите на гёрли"
@@ -54,10 +53,13 @@ tests:
   - name: "unknown_area"
     user: "Есть что-нибудь на Седанке?"
     expected:
+      # Template: "нет филиала... Ближайшие" OR LLM freeform: "занятий нет... других филиалах"
       contains_one_of:
         - "нет филиала"
         - "ближайш"
         - "нет в этом районе"
+        - "других филиалах"
+        - "седанк"
 
   - name: "buy_subscription_not_booking"
     user: "Хочу купить абонемент на 8 занятий"

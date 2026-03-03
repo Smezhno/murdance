@@ -36,14 +36,18 @@ _BRANCHES = [
     {
         "id": "semenovskaya",
         "name": "Семёновская",
+        "crm_branch_id": "ZZ",
         "address": "Семёновская 30а (стеклянное здание, крайняя дверь справа)",
         "styles": ["high-heels", "girly-hiphop"],
+        "aliases": ["семёновская", "семеновская"],
     },
     {
         "id": "gogolya",
         "name": "Гоголя",
+        "crm_branch_id": "XX",
         "address": "Красного Знамени 59, 8 этаж",
         "styles": ["high-heels"],
+        "aliases": ["гоголя", "красного знамени"],
     },
 ]
 

@@ -126,6 +126,9 @@ class SlotValues(BaseModel):
     branch_id: str | None = None
     style_id: int | str | None = None
 
+    # === RFC-005: escalation offer after closed group (on "да" → escalate) ===
+    escalation_pending_reason: str | None = None
+
 
 class Session(BaseModel):
     """Conversation session model (CONTRACT §4, §7).
