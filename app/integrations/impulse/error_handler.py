@@ -26,41 +26,38 @@ class ImpulseErrorHandler:
             Tuple of (user_message, should_fallback)
             should_fallback is True if error should go to fallback queue
         """
-        # Unwrap tenacity RetryError to get actual exception
+        # Unwrap tenacity.RetryError to get actual HTTP error
+        actual = error
         try:
             import tenacity
             if isinstance(error, tenacity.RetryError):
                 last = getattr(error, "last_attempt", None)
                 if last is not None:
-                    outcome = getattr(last, "outcome", None)
-                    if outcome is not None and not getattr(outcome, "cancelled", lambda: False)():
-                        try:
-                            inner = outcome.exception()
-                        except Exception:
-                            inner = None
-                        else:
-                            if inner is not None:
-                                logger.warning(
-                                    "unwrapped_retry_error original=%s inner=%s",
-                                    type(error).__name__,
-                                    type(inner).__name__,
-                                )
-                                error = inner
+                    inner = last.exception()
+                    if inner is not None:
+                        actual = inner
+                        logger.info(
+                            "UNWRAPPED_RETRY_ERROR: %s → %s",
+                            type(error).__name__,
+                            type(inner).__name__,
+                        )
         except ImportError:
             pass
+        except Exception:
+            pass
 
-        # Log HTTP details when available
-        if isinstance(error, httpx.HTTPStatusError):
+        # Log response body if available (critical for CRM 500 debugging)
+        if hasattr(actual, "response") and actual.response is not None:
             logger.error(
-                "crm_http_error status=%d url=%s body=%.500s",
-                error.response.status_code,
-                str(error.request.url),
-                (error.response.text or "")[:500],
+                "CRM_HTTP_ERROR: status=%d url=%s body=%.1000s",
+                actual.response.status_code,
+                str(getattr(getattr(actual, "request", None), "url", "?")),
+                (actual.response.text or "")[:1000],
             )
 
         # HTTP status errors
-        if isinstance(error, httpx.HTTPStatusError):
-            status = error.response.status_code
+        if isinstance(actual, httpx.HTTPStatusError):
+            status = actual.response.status_code
             if status >= 500:
                 return (
                     "Технический сбой. Записал заявку — администратор подтвердит.",
@@ -78,14 +75,14 @@ class ImpulseErrorHandler:
                 )
 
         # Timeout errors
-        if isinstance(error, httpx.TimeoutException):
+        if isinstance(actual, httpx.TimeoutException):
             return (
                 "Превышено время ожидания. Записал заявку — администратор подтвердит.",
                 True,
             )
 
         # Circuit breaker open
-        error_str = str(error).lower()
+        error_str = str(actual).lower()
         if "circuit breaker" in error_str:
             return (
                 "Сервис временно недоступен. Записал заявку — администратор подтвердит.",

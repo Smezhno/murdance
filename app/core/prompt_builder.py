@@ -42,24 +42,23 @@ class PromptBuilder:
 
     def __init__(self, kb: KnowledgeBase) -> None:
         self._kb = kb
+        from app.knowledge.retriever import KBRetriever
+        self._retriever = KBRetriever(kb)
 
     def build_system_prompt(
         self,
         slots: SlotValues,
         phase: ConversationPhase,
-        schedule_data: list | None = None,
+        schedule_data: list | None = None,  # DEPRECATED, kept for compatibility
+        user_text: str = "",
     ) -> str:
         """Build full system prompt. Called once per LLM invocation."""
         sections = [
             self._role_and_tone(),
             self._sales_rules(),
             self._format_slots_context(slots, phase),
-            self._format_conversation_history(slots),
-            self._format_kb_context(slots, phase),
-        ]
-        if schedule_data:
-            sections.append(self._format_schedule(schedule_data))
-        sections += [
+            self._contact_collection_instruction(slots),
+            self._retriever.retrieve(user_text, phase, slots).text,
             self._format_tools(),
             self._constraints(),
             self._intent_rules(),
@@ -174,10 +173,22 @@ class PromptBuilder:
         state = {"phase": phase.value, "collected": collected, "missing": missing, "flags": flags}
         return f"ТЕКУЩЕЕ СОСТОЯНИЕ ДИАЛОГА:\n{json.dumps(state, ensure_ascii=False, indent=2)}"
 
+    def _contact_collection_instruction(self, slots: SlotValues) -> str:
+        """When name/phone are missing, require asking for them; forbid receipt-style reply."""
+        missing = [k for k in _REQUIRED_BOOKING_SLOTS if not getattr(slots, k, None)]
+        if "client_name" not in missing and "client_phone" not in missing:
+            return ""
+        return """\
+ОБЯЗАТЕЛЬНО СЕЙЧАС:
+В "missing" есть client_name и/или client_phone. Ты ОБЯЗАН задать один вопрос: как зовут и какой телефон для связи.
+ЗАПРЕЩЕНО писать о подтверждении записи, давать адрес филиала или dress code ("что взять с собой") — только после получения имени и телефона.\
+"""
+
     # -------------------------------------------------------------------------
     # §5.4 — Conversation history (last 10 messages, RFC-003 §5.4)
     # -------------------------------------------------------------------------
 
+    # DEPRECATED by RFC-006 — kept for rollback
     def _format_conversation_history(self, slots: SlotValues) -> str:
         """Inject last 10 messages so LLM knows what was already shown (RFC-003 §5.4)."""
         if not getattr(slots, "messages", None):
@@ -194,6 +205,7 @@ class PromptBuilder:
     # §5.4 — KB context (phase-aware, no aliases)
     # -------------------------------------------------------------------------
 
+    # DEPRECATED by RFC-006 — kept for rollback
     def _format_kb_context(self, slots: SlotValues, phase: ConversationPhase) -> str:
         lines: list[str] = []
 
@@ -252,6 +264,7 @@ class PromptBuilder:
             return ""
         return "ДАННЫЕ СТУДИИ:\n" + "\n".join(lines)
 
+    # DEPRECATED by RFC-006 — kept for rollback
     def _prices_summary(self) -> str:
         if not self._kb.subscriptions:
             return ""
@@ -268,6 +281,7 @@ class PromptBuilder:
     # Schedule data (pre-fetched from CRM)
     # -------------------------------------------------------------------------
 
+    # DEPRECATED by RFC-006 — kept for rollback
     def _format_schedule(self, schedule_data: list) -> str:
         """Format pre-fetched CRM schedule for LLM context.
 
@@ -301,7 +315,7 @@ class PromptBuilder:
 
 - get_filtered_schedule(style, branch, teacher) — расписание с фильтрами. Вызывай ПЕРЕД показом расписания.
 - search_kb(query) — поиск в базе знаний: цены, FAQ, описания, адреса, dress code.
-- create_booking(schedule_id, client_name, client_phone) — создать запись. ТОЛЬКО после явного "да".
+- create_booking(schedule_id, client_name, client_phone) — создать запись. schedule_id — ЧИСЛОВОЙ ID из расписания CRM (например 329), НЕ дата и не время. ТОЛЬКО после явного "да" от клиента.
 - start_cancel_flow() — начать отмену записи.
 - escalate_to_admin(reason) — передать диалог администратору.\
 """
@@ -323,7 +337,8 @@ class PromptBuilder:
 - Никогда не говори что направление "больше не преподаётся" или "закрыто" — если оно есть в списке направлений выше, оно активно.
 - Когда клиент просит перечислить все направления — называй ВСЕ из списка, без сокращений.
 - Не предлагай клиенту даты помеченные ❌ ЗАКРЫТО или 🚫 ВЫХОДНОЙ.
-- Предпочитай даты помеченные ⭐ НОВАЯ ХОРЕОГРАФИЯ — это лучший момент для записи новичков.\
+- Предпочитай даты помеченные ⭐ НОВАЯ ХОРЕОГРАФИЯ — это лучший момент для записи новичков.
+- Если tool (get_filtered_schedule, search_kb) вернул данные — используй данные из tool, а не из системного контекста. Tool output = source of truth для расписания и наличия мест.\
 """
 
     # -------------------------------------------------------------------------
@@ -358,6 +373,8 @@ class PromptBuilder:
 Пример: клиент "хочу к Настюше на каблуки на Гоголя" → slot_updates: {"teacher_raw": "настюше", "style_raw": "каблуки", "branch_raw": "гоголя"}
 Пример: клиент "запишите на гёрли" → slot_updates: {"style_raw": "гёрли"}
 Пример: клиент "хочу на занятие завтра вечером" → slot_updates: {"datetime_raw": "завтра вечером"} (teacher_raw, style_raw, branch_raw не заполняй — клиент их не назвал)
+
+Если в ТЕКУЩЕМ СОСТОЯНИИ ДИАЛОГА уже заполнены teacher, group, branch (в collected) — НЕ отправляй teacher_raw, style_raw, branch_raw повторно. Отправляй *_raw ТОЛЬКО когда клиент ВПЕРВЫЕ называет эти данные или меняет выбор.
 
 ФОРМАТ ОТВЕТА — строго JSON, без markdown-обёртки:
 {

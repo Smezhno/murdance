@@ -322,6 +322,86 @@ async def _format_schedule_with_availability(
     return "\n".join(lines), cache, first_slot
 
 
+def _entry_style_id(entry: Any) -> Any:
+    """Extract style ID from schedule entry. Schedule has group.style.id, not top-level style_id."""
+    if hasattr(entry, "group") and isinstance(entry.group, dict):
+        style = entry.group.get("style")
+        if isinstance(style, dict):
+            return style.get("id")
+        if style is not None and hasattr(style, "id"):
+            return getattr(style, "id", None)
+    return None
+
+
+def _entry_branch_id(entry: Any) -> Any:
+    """Extract branch ID from schedule entry."""
+    if hasattr(entry, "branch") and isinstance(entry.branch, dict):
+        return entry.branch.get("id")
+    return getattr(entry, "branch_id", None)
+
+
+def _entry_teacher_id(entry: Any) -> Any:
+    """Extract teacher ID from schedule entry (group.teacher1.id)."""
+    if hasattr(entry, "group") and isinstance(entry.group, dict):
+        t1 = entry.group.get("teacher1")
+        if isinstance(t1, dict):
+            return t1.get("id")
+        if t1 is not None and hasattr(t1, "id"):
+            return getattr(t1, "id", None)
+    return getattr(entry, "teacher_id", None)
+
+
+def _matches_filter(
+    entry: Any,
+    style_id: Any,
+    branch_id: Any,
+    teacher_id: Any,
+    group_name: str | None,
+    branch_name: str | None,
+    teacher_name: str | None,
+) -> bool:
+    """Filter schedule entry. IDs take priority over string names (RFC-006 Phase 2).
+    When a filter ID is set but entry has no such ID, entry is excluded (no silent pass).
+    """
+    # Style filter (Schedule has group.style.id, not entry.style_id)
+    if style_id is not None:
+        entry_style_id = _entry_style_id(entry)
+        if entry_style_id is None:
+            return False
+        if str(entry_style_id) != str(style_id):
+            return False
+    elif group_name:
+        entry_name = getattr(entry, "style_name", "") or ""
+        if group_name.lower() not in entry_name.lower():
+            return False
+
+    # Branch filter
+    if branch_id is not None:
+        entry_branch_id = _entry_branch_id(entry)
+        if entry_branch_id is None:
+            return False
+        if str(entry_branch_id) != str(branch_id):
+            return False
+    elif branch_name:
+        entry_branch = getattr(entry, "branch_name", "") or ""
+        if branch_name.lower() not in entry_branch.lower():
+            return False
+
+    # Teacher filter (Schedule has group.teacher1.id)
+    if teacher_id is not None:
+        entry_teacher_id = _entry_teacher_id(entry)
+        if entry_teacher_id is None:
+            return False
+        if str(entry_teacher_id) != str(teacher_id):
+            return False
+    elif teacher_name:
+        entry_teacher = getattr(entry, "teacher_name", "") or ""
+        if teacher_name.lower() not in entry_teacher.lower():
+            return False
+
+    return True
+
+
 async def generate_schedule_response(
     impulse_adapter: Any,
     slots: dict[str, Any],
@@ -348,47 +428,56 @@ async def generate_schedule_response(
     if not schedules:
         return "На ближайшие дни занятий не найдено. Уточните у администратора.", {}, None
 
-    # Filter by branch_id when present (RFC-004), else by branch name
-    branch_id = slots.get("branch_id")
-    if branch_id is not None and schedules and hasattr(schedules[0], "branch"):
-        sid = str(branch_id)
-        schedules = [
-            s for s in schedules
-            if getattr(s, "branch", None) and str((s.branch or {}).get("id")) == sid
-        ]
-    else:
-        slot_branch = (slots.get("branch") or "").strip().lower()
-        if slot_branch and schedules and hasattr(schedules[0], "branch_name"):
-            s_branch_norm = slot_branch
-            schedules = [
-                s for s in schedules
-                if getattr(s, "branch_name", None)
-                and (s.branch_name.strip().lower() == s_branch_norm
-                     or s_branch_norm in s.branch_name.strip().lower()
-                     or s.branch_name.strip().lower() in s_branch_norm)
-            ]
-    # Filter by style_id when present (RFC-004)
+    if schedules:
+        s = schedules[0]
+        print(f"SCHEDULE_TYPE: {type(s)}")
+        print(f"SCHEDULE_DICT: {s.model_dump() if hasattr(s, 'model_dump') else vars(s)}")
+        print(f"HAS_GROUP_DICT: {hasattr(s, 'group') and isinstance(getattr(s, 'group', None), dict)}")
+        print(f"HAS_STYLE_ID: {hasattr(s, 'style_id')}")
+        print(f"HAS_TEACHER_ID: {hasattr(s, 'teacher_id')}")
+        print(f"GROUP_VALUE: {getattr(s, 'group', 'NO_ATTR')}")
+        print(f"BRANCH_VALUE: {getattr(s, 'branch', 'NO_ATTR')}")
+
     style_id = slots.get("style_id")
-    if style_id is not None and schedules and hasattr(schedules[0], "group"):
-        sid = str(style_id)
-        schedules = [
-            s for s in schedules
-            if getattr(s, "group", None)
-            and str((s.group or {}).get("style", {}).get("id")) == sid
-        ]
-    # Filter by teacher_id when present (RFC-004)
+    branch_id = slots.get("branch_id")
     teacher_id = slots.get("teacher_id")
-    if teacher_id is not None and schedules and hasattr(schedules[0], "group"):
-        tid = str(teacher_id)
-        schedules = [
-            s for s in schedules
-            if getattr(s, "group", None)
-            and str((s.group or {}).get("teacher1", {}).get("id")) == tid
-        ]
+    group_name = (slots.get("group") or "").strip() or None
+    branch_name = (slots.get("branch") or "").strip() or None
+    teacher_name = (slots.get("teacher") or "").strip() or None
+
+    if schedules:
+        print(
+            f"ENTRY_ATTRS: style_id={hasattr(schedules[0], 'style_id')} "
+            f"teacher_id={hasattr(schedules[0], 'teacher_id')}"
+        )
+    for i, entry in enumerate(schedules[:3]):
+        print(
+            f"MATCH_DEBUG: entry[{i}] has style_id={hasattr(entry, 'style_id')} "
+            f"group={type(getattr(entry, 'group', None)).__name__} "
+            f"extracted_style_id={_entry_style_id(entry)} "
+            f"branch_id={_entry_branch_id(entry)} "
+            f"teacher_id={_entry_teacher_id(entry)}"
+        )
+
+    filtered = [
+        s
+        for s in schedules
+        if _matches_filter(
+            s, style_id, branch_id, teacher_id,
+            group_name, branch_name, teacher_name,
+        )
+    ]
+    print(
+        f"SCHEDULE_FILTER: total={len(schedules)} style_id={style_id} branch_id={branch_id} "
+        f"teacher_id={teacher_id} → {len(filtered)} matches"
+    )
+    schedules = filtered
     if not schedules:
         return "На ближайшие дни занятий не найдено. Уточните у администратора.", {}, None
 
-    was_filtered = slots.get("style_id") is not None or slots.get("teacher_id") is not None
+    was_filtered = (
+        style_id is not None or branch_id is not None or teacher_id is not None
+    )
 
     if availability_provider is not None:
         try:

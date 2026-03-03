@@ -5,6 +5,7 @@ create_booking, list_bookings, cancel_booking, health_check.
 RFC-005: get_additions for schedule/addition (sticker additions).
 """
 
+import json as _json
 import logging
 from functools import lru_cache
 from datetime import date, datetime, time as dt_time, timedelta
@@ -84,6 +85,7 @@ class ImpulseAdapter:
             return schedules
 
         except Exception as e:
+            logger.exception("Impulse CRM error: %s", e)
             user_msg, should_fallback = self.error_handler.handle_error(e)
             if should_fallback:
                 await self.fallback.enqueue(
@@ -139,6 +141,7 @@ class ImpulseAdapter:
             return out
 
         except Exception as e:
+            logger.exception("Impulse CRM error: %s", e)
             user_msg, should_fallback = self.error_handler.handle_error(e)
             if should_fallback:
                 await self.fallback.enqueue("get_teacher_list", {}, str(e))
@@ -170,6 +173,7 @@ class ImpulseAdapter:
             return groups
 
         except Exception as e:
+            logger.exception("Impulse CRM error: %s", e)
             user_msg, should_fallback = self.error_handler.handle_error(e)
             if should_fallback:
                 await self.fallback.enqueue("get_groups", {}, str(e))
@@ -206,6 +210,7 @@ class ImpulseAdapter:
             return Client(**data[0])
 
         except Exception as e:
+            logger.exception("Impulse CRM error: %s", e)
             user_msg, should_fallback = self.error_handler.handle_error(e)
             if should_fallback:
                 await self.fallback.enqueue("find_client", {"phone": phone}, str(e))
@@ -241,6 +246,7 @@ class ImpulseAdapter:
             return items
 
         except Exception as e:
+            logger.exception("Impulse CRM error: %s", e)
             # Unwrap RetryError → get actual HTTP error
             actual_error = e
             try:
@@ -356,6 +362,7 @@ class ImpulseAdapter:
             return Client(id=0, name=name, phone=[normalized_phone])
 
         except Exception as e:
+            logger.exception("Impulse CRM error: %s", e)
             user_msg, should_fallback = self.error_handler.handle_error(e)
             if should_fallback:
                 await self.fallback.enqueue(
@@ -402,12 +409,25 @@ class ImpulseAdapter:
                 ts = int(midnight.astimezone(tz.utc).timestamp())
 
             # Fetch raw schedule object — CRM needs full nested dict in 'time' array
+            # schedule_id from slots is str, CRM returns int — compare as int
+            try:
+                sid_int = int(schedule_id)
+            except (ValueError, TypeError):
+                sid_int = schedule_id
             raw_schedules = await self.client.list("schedule", filters=None, limit=1000)
-            raw_schedule = next((s for s in raw_schedules if s.get("id") == schedule_id), None)
+            raw_schedule = next((s for s in raw_schedules if s.get("id") == sid_int), None)
+
+            print(f"RAW_SCHEDULE_FOUND: {raw_schedule is not None} schedule_id={schedule_id}")
+            if raw_schedule is not None:
+                print(f"RAW_SCHEDULE_GROUP: {raw_schedule.get('group') is not None}")
+                print(f"RAW_SCHEDULE_BRANCH: {raw_schedule.get('branch') is not None}")
+                group = raw_schedule.get("group")
+                if group is None:
+                    print(f"WARNING: raw_schedule has no group! Keys: {list(raw_schedule.keys())}")
 
             data: dict[str, Any] = {
                 "client": {"id": client_id},
-                "schedule": {"id": schedule_id},
+                "schedule": {"id": sid_int},
                 "type": 0,
             }
             if ts is not None:
@@ -418,10 +438,14 @@ class ImpulseAdapter:
                 time_entry: dict[str, Any] = {
                     "minutes": raw_schedule.get("minutesBegin"),
                     "schedule": raw_schedule,
-                    "group": raw_schedule.get("group"),
                     "type": 0,
                     "source": 0,
                 }
+                group_data = raw_schedule.get("group")
+                if group_data is not None:
+                    time_entry["group"] = group_data
+                else:
+                    print(f"WARNING_NO_GROUP: schedule_id={schedule_id}, skipping group in time entry")
                 if ts is not None:
                     time_entry["date"] = ts
                 data["time"] = [time_entry]
@@ -429,6 +453,9 @@ class ImpulseAdapter:
             if notes:
                 data["annotation"] = notes
 
+            print(
+                f"CREATE_BOOKING_REQUEST: {_json.dumps(data, default=str, ensure_ascii=False)[:2000]}"
+            )
             result = await self.client.create("reservation", data)
 
             # Invalidate all schedule cache keys
@@ -447,6 +474,27 @@ class ImpulseAdapter:
             return Reservation(**result)
 
         except Exception as e:
+            logger.exception("Impulse CRM error: %s", e)
+
+            actual_err = e
+            try:
+                import tenacity
+                if isinstance(e, tenacity.RetryError):
+                    last = getattr(e, "last_attempt", None)
+                    if last is not None:
+                        inner = last.exception()
+                        if inner is not None:
+                            actual_err = inner
+            except ImportError:
+                pass
+
+            if hasattr(actual_err, "response") and actual_err.response is not None:
+                logger.error(
+                    "CREATE_BOOKING_CRM_RESPONSE: status=%d body=%.1000s",
+                    actual_err.response.status_code,
+                    (actual_err.response.text or "")[:1000],
+                )
+
             user_msg, should_fallback = self.error_handler.handle_error(e)
             if should_fallback:
                 await self.fallback.enqueue(
@@ -500,6 +548,7 @@ class ImpulseAdapter:
             return reservations
 
         except Exception as e:
+            logger.exception("Impulse CRM error: %s", e)
             user_msg, should_fallback = self.error_handler.handle_error(e)
             if should_fallback:
                 await self.fallback.enqueue(
@@ -531,6 +580,7 @@ class ImpulseAdapter:
             return success
 
         except Exception as e:
+            logger.exception("Impulse CRM error: %s", e)
             user_msg, should_fallback = self.error_handler.handle_error(e)
             if should_fallback:
                 await self.fallback.enqueue(

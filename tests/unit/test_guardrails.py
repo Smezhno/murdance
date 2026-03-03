@@ -142,6 +142,18 @@ class TestG1:
         assert _has(r.violations, "G12")
         assert not _has(r.violations, "G1")
 
+    @pytest.mark.asyncio
+    async def test_g1_passes_when_tool_called_rfc006(self, runner):
+        """G1 should pass when get_filtered_schedule was executed (RFC-006: crm_schedule=None)."""
+        tc = ToolCall(name="get_filtered_schedule", parameters={"style": "High Heels"})
+        r = await runner.check(
+            _resp("Ближайшее занятие в 19:00 в пятницу", tool_calls=[tc]),
+            SlotValues(), ConversationPhase.SCHEDULE,
+            crm_schedule=None,
+            executed_tools={"get_filtered_schedule"},
+        )
+        assert not _has(r.violations, "G1")
+
 
 # ---------------------------------------------------------------------------
 # G2 — Prices must match KB (±50₽)
@@ -207,6 +219,58 @@ class TestG3:
     async def test_non_booking_intent_skips_g3(self, runner):
         r = await runner.check(_resp(intent="continue"), SlotValues(), ConversationPhase.DISCOVERY)
         assert not any("G3" in v for v in r.violations)
+
+
+# ---------------------------------------------------------------------------
+# G3b — No receipt/address/dress code before name and phone
+# ---------------------------------------------------------------------------
+
+class TestG3b:
+    @pytest.mark.asyncio
+    async def test_receipt_phrase_without_contact_blocks(self, runner):
+        slots = SlotValues(group="High Heels", datetime_resolved=_future_dt(), branch="Тест")
+        r = await runner.check(
+            _resp(message="Запись подтверждена! Адрес: Тест, 1. С собой: носочки."),
+            slots, ConversationPhase.CONFIRMATION,
+        )
+        assert any("G3b" in v for v in r.violations)
+
+    @pytest.mark.asyncio
+    async def test_dress_code_without_contact_blocks(self, runner):
+        slots = SlotValues(group="High Heels", datetime_resolved=_future_dt())
+        r = await runner.check(
+            _resp(message="Отлично! Владивосток, филиал Тест. Что взять с собой: носочки."),
+            slots, ConversationPhase.CONFIRMATION,
+        )
+        assert any("G3b" in v for v in r.violations)
+
+    @pytest.mark.asyncio
+    async def test_ask_name_phone_passes(self, runner):
+        slots = SlotValues(group="High Heels", datetime_resolved=_future_dt())
+        r = await runner.check(
+            _resp(message="Как вас зовут и какой номер телефона для связи?"),
+            slots, ConversationPhase.CONFIRMATION,
+        )
+        assert not any("G3b" in v for v in r.violations)
+
+    @pytest.mark.asyncio
+    async def test_receipt_with_contact_passes(self, runner):
+        slots = SlotValues(group="High Heels", client_name="Маша",
+                           client_phone="89241234567", datetime_resolved=_future_dt())
+        r = await runner.check(
+            _resp(message="✅ Запись подтверждена! С собой: носочки."),
+            slots, ConversationPhase.BOOKING,
+        )
+        assert not any("G3b" in v for v in r.violations)
+
+    @pytest.mark.asyncio
+    async def test_g3b_skips_discovery(self, runner):
+        slots = SlotValues()
+        r = await runner.check(
+            _resp(message="Что взять с собой: удобная форма."),
+            slots, ConversationPhase.DISCOVERY,
+        )
+        assert not any("G3b" in v for v in r.violations)
 
 
 # ---------------------------------------------------------------------------
@@ -436,6 +500,19 @@ class TestG10:
     async def test_no_crm_schedule_skips_g10(self, runner):
         tc = ToolCall(name="create_booking", parameters={"schedule_id": "999"})
         r = await runner.check(_resp(tool_calls=[tc]), SlotValues(), ConversationPhase.BOOKING)
+        assert not any("G10" in v for v in r.violations)
+
+    @pytest.mark.asyncio
+    async def test_g10_passes_when_no_crm_schedule_rfc006(self, runner):
+        """G10 should pass when crm_schedule is None (RFC-006; CRM rejects invalid schedule_id)."""
+        slots = SlotValues(confirmed=True, group="High Heels", client_name="Маша",
+                           client_phone="89241234567", datetime_resolved=_future_dt())
+        tc = ToolCall(name="create_booking", parameters={"schedule_id": "42"})
+        r = await runner.check(
+            _resp(tool_calls=[tc]), slots, ConversationPhase.BOOKING,
+            crm_schedule=None,
+            executed_tools={"get_filtered_schedule"},
+        )
         assert not any("G10" in v for v in r.violations)
 
 

@@ -118,8 +118,8 @@ class TeacherResolver:
     def resolve(self, raw: str, tenant_id: str) -> list[ResolvedEntity]:
         """
         Algorithm: 1) normalized = raw.strip().lower(); 2) exact in _lookup → return;
-        3) pymorphy3 normal_form → lookup; 4) else [].
-        NO fuzzy. pymorphy3 only when exact fails.
+        3) if " " in normalized: match by each word (intersection of teachers);
+        4) pymorphy3 normal_form → lookup; 5) else [].
         """
         _ = tenant_id
         normalized = raw.strip().lower()
@@ -127,6 +127,34 @@ class TeacherResolver:
             return []
         if normalized in self._lookup:
             return list(self._lookup[normalized])
+        # Multi-word input (e.g. "тане шекуновой") — lookup each word, return teachers in intersection
+        if " " in normalized:
+            candidates: list[ResolvedEntity] | None = None
+            for word in normalized.split():
+                word = word.strip()
+                if not word:
+                    continue
+                by_word = self._lookup.get(word)
+                if by_word is None:
+                    try:
+                        morph = get_morph()
+                        parsed = morph.parse(word)
+                        if parsed:
+                            lemma = parsed[0].normal_form
+                            by_word = self._lookup.get(lemma, [])
+                        else:
+                            by_word = []
+                    except Exception:
+                        by_word = []
+                if candidates is None:
+                    candidates = list(by_word)
+                else:
+                    ids_seen = {e.crm_id for e in candidates}
+                    candidates = [e for e in by_word if e.crm_id in ids_seen]
+                if not candidates:
+                    break
+            if candidates:
+                return candidates
         try:
             morph = get_morph()
             parsed = morph.parse(normalized)

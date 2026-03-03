@@ -25,7 +25,7 @@ from app.core.conversation import get_or_create_session, save_session_to_store, 
 from app.core.entity_resolver.protocol import EntityResolver
 from app.core.guardrails import GuardrailRunner
 from app.core.prompt_builder import LLMResponse as CoreLLMResponse, PromptBuilder, ToolCall
-from app.core.schedule_flow import fetch_schedule, generate_schedule_response
+from app.core.schedule_flow import generate_schedule_response
 from app.core.slot_tracker import ConversationPhase, compute_phase
 from app.integrations.impulse import get_impulse_adapter
 from app.integrations.impulse.models import impulse_day_to_weekday
@@ -34,9 +34,26 @@ from app.models import SlotValues, UnifiedMessage
 
 logger = logging.getLogger(__name__)
 
-_CONFIRM_YES = {"да", "yes", "ок", "ok", "+", "подтверждаю", "подтверждаем"}
+_CONFIRM_YES = {
+    "да", "yes", "ок", "ok", "+",
+    "подтверждаю", "подтверждаем",
+    "давай", "конечно", "запиши", "записывай",
+    "хочу", "go", "ага", "угу", "давайте",
+}
 _CONFIRM_NO = {"нет", "no", "-", "отмена", "cancel"}
 _MAX_RETRIES = 2
+
+
+def _summarize_tool_result(tool_name: str, result_text: str) -> str:
+    """Compact tool result for LLM context. Keeps first 500 chars."""
+    if len(result_text) <= 500:
+        return result_text
+    lines = result_text.strip().split("\n")
+    kept = lines[:6]
+    if len(lines) > 6:
+        kept.append(f"(и ещё {len(lines) - 6} строк)")
+    summary = "\n".join(kept)
+    return summary[:500]
 _HISTORY_KEEP = 50  # stored in session; LLM sees last 10 via prompt_builder
 
 
@@ -168,27 +185,12 @@ class ConversationEngine:
                 await save_session_to_store(session)
                 return response
 
-        # --- Pre-fetch CRM schedule if needed ---
-        crm_schedule: list = []
-        if phase in (
-            ConversationPhase.SCHEDULE,
-            ConversationPhase.COLLECTING_CONTACT,
-            ConversationPhase.CONFIRMATION,
-        ):
-            try:
-                result = await fetch_schedule(self._impulse, slots.model_dump(), trace_id)
-                if isinstance(result, list):
-                    crm_schedule = result
-            except Exception as exc:
-                logger.warning("schedule pre-fetch failed: %s", exc)
-
-        # --- LLM loop with guardrail retries ---
+        # --- LLM loop (schedule only via tool get_filtered_schedule, not in system prompt) ---
         response = await self._llm_loop(
             message=message,
             session=session,
             slots=slots,
             phase=phase,
-            crm_schedule=crm_schedule,
             trace_id=trace_id,
         )
 
@@ -206,13 +208,17 @@ class ConversationEngine:
         session: Any,
         slots: SlotValues,
         phase: ConversationPhase,
-        crm_schedule: list,
         trace_id: UUID,
     ) -> str:
         violation_hint = ""
         executed_tools: set[str] = set()
         for attempt in range(_MAX_RETRIES + 1):
-            system_prompt = self._pb.build_system_prompt(slots, phase, crm_schedule)
+            system_prompt = self._pb.build_system_prompt(
+                slots, phase,
+                schedule_data=None,
+                user_text=message.text or "",
+            )
+            print(f"SYSTEM_PROMPT_SIZE: {len(system_prompt)} chars")
             if violation_hint:
                 system_prompt += (
                     f"\n\nПРЕДЫДУЩИЙ ОТВЕТ ОТКЛОНЁН. Нарушения: {violation_hint}. Исправь."
@@ -232,12 +238,30 @@ class ConversationEngine:
 
             # If LLM requested create_booking, convert to intent="booking" so guardrails
             # (G3, G4) validate slots and confirmed=True BEFORE any CRM write happens.
-            # The actual booking is executed on the next handle_message() cycle via the
-            # BOOKING fast path in handle_message().
+            # The actual booking is executed via confirm_booking() which uses session.slots.schedule_id
+            # (set by get_filtered_schedule). We never take schedule_id from LLM params.
+            # Persist client_name/client_phone from create_booking params into slot_updates
+            # so they are applied to session.slots (LLM often sends them only in tool params).
             if any(tc.name == "create_booking" for tc in parsed.tool_calls):
+                cb = next((tc for tc in parsed.tool_calls if tc.name == "create_booking"), None)
+                merged_updates = dict(parsed.slot_updates) if parsed.slot_updates else {}
+                if cb and cb.parameters:
+                    sid_param = cb.parameters.get("schedule_id")
+                    if sid_param is not None:
+                        try:
+                            int(sid_param)
+                        except (ValueError, TypeError):
+                            logger.warning(
+                                "LLM sent non-numeric schedule_id=%s, booking will use slots.schedule_id=%s",
+                                sid_param, getattr(session.slots, "schedule_id", None),
+                            )
+                    for key in ("client_name", "client_phone"):
+                        val = cb.parameters.get(key)
+                        if val and isinstance(val, str) and val.strip():
+                            merged_updates[key] = val.strip()
                 parsed = CoreLLMResponse(
                     message=parsed.message,
-                    slot_updates=parsed.slot_updates,
+                    slot_updates=merged_updates,
                     tool_calls=[tc for tc in parsed.tool_calls if tc.name != "create_booking"],
                     intent="booking",
                 )
@@ -266,7 +290,7 @@ class ConversationEngine:
                         return clarification
 
                 for tool_name, result_text in tool_results.items():
-                    capped = result_text[:3000] if len(result_text) > 3000 else result_text
+                    capped = _summarize_tool_result(tool_name, result_text)
                     messages.append({"role": "user", "content": f"[{tool_name}]: {capped}"})
                 try:
                     raw2: ProviderLLMResponse = await self._llm.call(messages, trace_id=trace_id)
@@ -297,7 +321,7 @@ class ConversationEngine:
                 parsed,
                 slots,
                 phase,
-                crm_schedule or None,
+                None,  # crm_schedule removed per RFC-006 (schedule only via tool calls)
                 executed_tools=executed_tools,
                 availability_cache=availability_cache if self._availability else None,
             )
@@ -800,6 +824,14 @@ def _empty_slots() -> dict:
         "schedule_id": None, "messages": [], "branch": None, "experience": None,
         "schedule_shown": False, "summary_shown": False, "confirmed": False,
         "booking_created": False, "receipt_sent": False,
+        # RFC-004 entity resolver IDs — MUST reset on /start
+        "teacher_id": None,
+        "style_id": None,
+        "branch_id": None,
+        # Raw values from LLM
+        "teacher_raw": None,
+        "style_raw": None,
+        "branch_raw": None,
     }
 
 

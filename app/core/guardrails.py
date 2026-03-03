@@ -75,18 +75,20 @@ class GuardrailRunner:
 
         # --- Hard checks (original message) ---
         # G12 is the primary schedule guard (no tool_call → block immediately).
-        # G1 is secondary — only runs when get_filtered_schedule was called but
-        # the time in the message doesn't match CRM data. They must not fire together.
+        # G1 is secondary — only when get_filtered_schedule was called and we have
+        # crm_schedule to verify times. After RFC-006 crm_schedule is None; tool data is source of truth.
         g12 = self._g12_schedule_mention_without_tool(message, tool_names, phase=phase)
         violations += g12
-        if not g12 and "get_filtered_schedule" in tool_names:
+        if not g12 and "get_filtered_schedule" in tool_names and crm_schedule is not None:
             violations += self._g1_schedule_hallucination(message, crm_schedule)
 
         violations += self._g2_price_hallucination(message)
         violations += self._g3_booking_slots(llm_response, slots)
+        violations += self._g3b_no_receipt_without_contact(message, slots, phase)
         violations += self._g4_booking_confirmation(tool_names, slots)
         violations += self._g5_teacher_comparison(message)
         violations += self._g9_receipt_completeness(message, slots, phase)
+        # G10: when crm_schedule is None (RFC-006), skip — CRM rejects invalid schedule_id via API
         violations += self._g10_schedule_id_exists(tool_map, crm_schedule)
         violations += self._g11_datetime_in_future(llm_response)
         violations += self._g13_intent_context(llm_response)
@@ -157,6 +159,26 @@ class GuardrailRunner:
         if missing:
             return [f"G3: missing required slots for booking: {missing}"]
         return []
+
+    # -------------------------------------------------------------------------
+    # G3b — No receipt / address / dress code before collecting name and phone
+    # -------------------------------------------------------------------------
+
+    def _g3b_no_receipt_without_contact(
+        self, message: str, slots: SlotValues, phase: ConversationPhase
+    ) -> list[str]:
+        """Block receipt-like or post-booking content when client_name/phone are missing."""
+        if phase not in (ConversationPhase.CONFIRMATION, ConversationPhase.BOOKING):
+            return []
+        if getattr(slots, "client_name", None) and getattr(slots, "client_phone", None):
+            return []
+        msg_lower = message.lower()
+        violations = []
+        if "запись подтверждена" in msg_lower or "✅" in message:
+            violations.append("G3b: нельзя писать о подтверждении записи без имени и телефона")
+        if "что взять с собой" in msg_lower or "с собой:" in msg_lower:
+            violations.append("G3b: нельзя давать dress code до сбора имени и телефона")
+        return violations
 
     # -------------------------------------------------------------------------
     # G4 — create_booking only after explicit confirmation
