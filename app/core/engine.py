@@ -7,6 +7,7 @@ RFC-005: pre-booking availability check (closed_group_handler).
 
 import json
 import logging
+import re
 from datetime import date, datetime
 from functools import lru_cache
 from typing import Any
@@ -27,9 +28,11 @@ from app.core.guardrails import GuardrailRunner
 from app.core.prompt_builder import LLMResponse as CoreLLMResponse, PromptBuilder, ToolCall
 from app.core.schedule_flow import generate_schedule_response
 from app.core.slot_tracker import ConversationPhase, compute_phase
+from app.config import get_settings
 from app.integrations.impulse import get_impulse_adapter
 from app.integrations.impulse.models import impulse_day_to_weekday
 from app.knowledge.base import KnowledgeBase, get_kb
+from app.queue.outbound import enqueue_message
 from app.models import SlotValues, UnifiedMessage
 
 logger = logging.getLogger(__name__)
@@ -43,17 +46,28 @@ _CONFIRM_YES = {
 _CONFIRM_NO = {"нет", "no", "-", "отмена", "cancel"}
 _MAX_RETRIES = 2
 
+# RFC-007 F13: per-tool summary limits (chars, lines)
+_TOOL_SUMMARY_LIMITS: dict[str, tuple[int, int]] = {
+    "get_filtered_schedule": (1200, 15),
+    "list_my_bookings": (800, 10),
+    "default": (500, 6),
+}
+
 
 def _summarize_tool_result(tool_name: str, result_text: str) -> str:
-    """Compact tool result for LLM context. Keeps first 500 chars."""
-    if len(result_text) <= 500:
+    """Compact tool result for LLM context. Limit by tool type (RFC-007 F13)."""
+    max_chars, max_lines = _TOOL_SUMMARY_LIMITS.get(
+        tool_name, _TOOL_SUMMARY_LIMITS["default"]
+    )
+    if len(result_text) <= max_chars:
         return result_text
     lines = result_text.strip().split("\n")
-    kept = lines[:6]
-    if len(lines) > 6:
-        kept.append(f"(и ещё {len(lines) - 6} строк)")
-    summary = "\n".join(kept)
-    return summary[:500]
+    kept = lines[:max_lines]
+    if len(lines) > max_lines:
+        kept.append(f"(и ещё {len(lines) - max_lines} строк)")
+    return "\n".join(kept)[:max_chars]
+
+
 _HISTORY_KEEP = 50  # stored in session; LLM sees last 10 via prompt_builder
 
 
@@ -105,6 +119,17 @@ class ConversationEngine:
 
         if message.text.startswith("/debug"):
             return self._handle_debug(session)
+
+        # --- Gibberish detection (RFC-007 F9) ---
+        if self._is_gibberish(message.text or ""):
+            count = (getattr(slots, "gibberish_count", 0) or 0) + 1
+            await update_slots(session, gibberish_count=count)
+            if count >= 3:
+                await self._notify_admin_gibberish(session)
+                return "Передаю тебя администратору — он ответит в ближайшее время."
+            return "Не совсем понял. Напиши, что интересует — направление, расписание, запись?"
+        if getattr(slots, "gibberish_count", 0):
+            await update_slots(session, gibberish_count=0)
 
         # --- Compute phase ---
         is_cancel = getattr(session, "state", None) and \
@@ -218,7 +243,7 @@ class ConversationEngine:
                 schedule_data=None,
                 user_text=message.text or "",
             )
-            print(f"SYSTEM_PROMPT_SIZE: {len(system_prompt)} chars")
+            logger.debug("SYSTEM_PROMPT_SIZE: %s chars", len(system_prompt))
             if violation_hint:
                 system_prompt += (
                     f"\n\nПРЕДЫДУЩИЙ ОТВЕТ ОТКЛОНЁН. Нарушения: {violation_hint}. Исправь."
@@ -234,7 +259,7 @@ class ConversationEngine:
 
             logger.info("LLM_RAW_RESPONSE: %.500s", (raw.text or "")[:500])
             parsed = self._parse_llm_response(raw.text)
-            print(f"DEBUG_LLM: {raw.text[:500]}")
+            logger.debug("DEBUG_LLM: %.500s", (raw.text or "")[:500])
 
             # If LLM requested create_booking, convert to intent="booking" so guardrails
             # (G3, G4) validate slots and confirmed=True BEFORE any CRM write happens.
@@ -272,6 +297,9 @@ class ConversationEngine:
             )
             if tool_results:
                 executed_tools.update(tool_results.keys())
+                recent = set(getattr(session.slots, "recent_tools", None) or [])
+                recent.update(tool_results.keys())
+                await update_slots(session, recent_tools=list(recent))
                 # Apply slot_updates from the first LLM response before overwriting parsed
                 if parsed.slot_updates:
                     logger.info("LLM_SLOT_UPDATES: %s", parsed.slot_updates)
@@ -288,6 +316,12 @@ class ConversationEngine:
                     )
                     if clarification:
                         return clarification
+
+                # Tool result IS the user response — no second LLM call (RFC-007 F3)
+                _DIRECT_RETURN_TOOLS = ("start_cancel_flow", "escalate_to_admin")
+                for _name in _DIRECT_RETURN_TOOLS:
+                    if _name in tool_results:
+                        return tool_results[_name]
 
                 for tool_name, result_text in tool_results.items():
                     capped = _summarize_tool_result(tool_name, result_text)
@@ -323,6 +357,7 @@ class ConversationEngine:
                 phase,
                 None,  # crm_schedule removed per RFC-006 (schedule only via tool calls)
                 executed_tools=executed_tools,
+                session_tools=set(getattr(slots, "recent_tools", None) or []),
                 availability_cache=availability_cache if self._availability else None,
             )
             if result.passed:
@@ -336,7 +371,15 @@ class ConversationEngine:
                 if parsed.intent == "booking" and slots.confirmed and not slots.booking_created:
                     missing = self._get_missing_booking_slots(slots)
                     if missing:
-                        return final_message  # LLM asked for missing info
+                        _MISSING_LABELS = {
+                            "branch": "филиал",
+                            "group": "направление",
+                            "datetime_resolved": "дата и время",
+                            "client_name": "имя",
+                            "client_phone": "номер телефона",
+                        }
+                        missing_labels = [_MISSING_LABELS.get(s, s) for s in missing]
+                        return f"Для записи нужно уточнить: {', '.join(missing_labels)}."
                     closed_msg = await self._maybe_handle_closed_before_booking(session, trace_id)
                     if closed_msg:
                         return closed_msg
@@ -426,14 +469,47 @@ class ConversationEngine:
                                 dt_resolved = dt_naive.replace(tzinfo=ZoneInfo("Asia/Vladivostok"))
                                 await update_slots(session, datetime_resolved=dt_resolved)
                         except Exception as e:
-                            print(f"SCHEDULE_SLOT_EXTRACT_FAILED: {e}")
-                        print(
-                            f"SLOTS_AFTER_SCHEDULE: sid={session.slots.schedule_id} dt={session.slots.datetime_resolved}"
+                            logger.debug("SCHEDULE_SLOT_EXTRACT_FAILED: %s", e)
+                        logger.debug(
+                            "SLOTS_AFTER_SCHEDULE: sid=%s dt=%s",
+                            session.slots.schedule_id,
+                            session.slots.datetime_resolved,
                         )
 
                 elif tc.name == "start_cancel_flow":
                     text = await get_cancel_flow().start(session, trace_id)
                     results[tc.name] = text
+
+                elif tc.name == "list_my_bookings":
+                    phone = tc.parameters.get("phone") or session.slots.client_phone
+                    if not phone or not str(phone).strip():
+                        results[tc.name] = "Для просмотра записей нужен ваш номер телефона."
+                    else:
+                        try:
+                            client = await self._impulse.find_client(str(phone).strip())
+                            if not client:
+                                results[tc.name] = "Клиент не найден."
+                            else:
+                                bookings = await self._impulse.list_bookings(
+                                    client_id=client.id, date_from=date.today()
+                                )
+                                if not bookings:
+                                    results[tc.name] = "Активных записей нет."
+                                else:
+                                    lines = []
+                                    for i, b in enumerate(bookings[:5]):
+                                        try:
+                                            bd = b.date_as_date
+                                            dt_str = bd.strftime("%d.%m.%Y") if bd else "?"
+                                            lines.append(
+                                                f"{i + 1}. {b.group_name}, {dt_str} в {b.time_str}"
+                                            )
+                                        except Exception:
+                                            lines.append(f"{i + 1}. (запись)")
+                                    results[tc.name] = "\n".join(lines)
+                        except Exception as exc:
+                            logger.warning("list_my_bookings failed: %s", exc)
+                            results[tc.name] = "Не удалось загрузить записи. Обратитесь к администратору."
 
                 elif tc.name == "search_kb":
                     query = tc.parameters.get("query", "")
@@ -446,7 +522,32 @@ class ConversationEngine:
                     results[tc.name] = text
 
                 elif tc.name == "escalate_to_admin":
-                    results[tc.name] = self._safe_fallback(ConversationPhase.ADMIN_HANDOFF)
+                    reason = tc.parameters.get("reason") or "Запрос эскалации"
+                    try:
+                        settings = get_settings()
+                        admin_chat_id = getattr(settings, "admin_telegram_chat_id", None)
+                        if admin_chat_id:
+                            last_msgs = getattr(session.slots, "messages", [])[-6:]
+                            context_lines = [
+                                f"⚠️ Эскалация от {session.chat_id}",
+                                f"Причина: {reason}",
+                            ]
+                            for m in last_msgs:
+                                role = "👤" if m.get("role") == "user" else "🤖"
+                                context_lines.append(f"{role} {(m.get('content') or '')[:80]}")
+                            admin_text = "\n".join(context_lines)
+                            await enqueue_message(
+                                chat_id=str(admin_chat_id),
+                                channel=session.channel,
+                                text=admin_text,
+                                trace_id=session.trace_id,
+                                priority=1,
+                            )
+                        else:
+                            logger.warning("admin_telegram_chat_id not set — skipping admin notify")
+                    except Exception as e:
+                        logger.warning("Failed to notify admin: %s", e)
+                    results[tc.name] = "Передаю тебя администратору — он ответит в ближайшее время."
 
                 else:
                     logger.warning("unknown tool_call: %s", tc.name)
@@ -456,6 +557,47 @@ class ConversationEngine:
                 results[tc.name] = f"Ошибка при выполнении {tc.name}."
 
         return results, availability_cache
+
+    # -------------------------------------------------------------------------
+    # RFC-007 F9: Gibberish detection
+    # -------------------------------------------------------------------------
+
+    _GIBBERISH_WHITELIST = frozenset(
+        {"да", "нет", "+", "-", "ок", "ага", "угу", "кек", "хз" "нее", "збс", "оки", "пон", "йеп", "ноу", "лол"}
+    )
+
+    def _is_gibberish(self, text: str) -> bool:
+        """Detect gibberish input. Conservative — don't block short valid messages."""
+        t = text.strip()
+        if t.lower() in self._GIBBERISH_WHITELIST or t.isdigit():
+            return False
+        if len(t) <= 1:
+            return False
+        words = re.findall(r"\b\w{2,}\b", t, re.UNICODE)
+        if not words and not re.search(r"\d", t):
+            return True
+        if len(t) >= 6 and len(set(t.replace(" ", ""))) <= 3:
+            return True
+        return False
+
+    async def _notify_admin_gibberish(self, session: Any) -> None:
+        """Notify admin that user sent 3+ gibberish messages in a row."""
+        try:
+            settings = get_settings()
+            admin_chat_id = getattr(settings, "admin_telegram_chat_id", None)
+            if admin_chat_id:
+                admin_text = f"⚠️ Gibberish/спам от {session.chat_id}. 3+ подряд."
+                await enqueue_message(
+                    chat_id=str(admin_chat_id),
+                    channel=session.channel,
+                    text=admin_text,
+                    trace_id=session.trace_id,
+                    priority=1,
+                )
+            else:
+                logger.warning("admin_telegram_chat_id not set — skipping gibberish notify")
+        except Exception as e:
+            logger.warning("Failed to notify admin (gibberish): %s", e)
 
     # -------------------------------------------------------------------------
     # RFC-005: Availability check before booking
@@ -530,7 +672,7 @@ class ConversationEngine:
         for msg in reversed(history):
             content = msg.get("content", "")
             if total_chars + len(content) > MAX_CHARS:
-                print(f"TOKEN_BUDGET_SKIP: dropping msg len={len(content)}, total={total_chars}")
+                logger.debug("TOKEN_BUDGET_SKIP: dropping msg len=%s, total=%s", len(content), total_chars)
                 continue
             included.append(msg)
             total_chars += len(content)
@@ -540,18 +682,27 @@ class ConversationEngine:
             if role in ("user", "assistant") and content:
                 messages.append({"role": role, "content": content})
         messages.append({"role": "user", "content": user_text})
-        print(f"BUILD_MESSAGES: {len(messages)} msgs, ~{total_chars} chars")
+        logger.debug("BUILD_MESSAGES: %s msgs, ~%s chars", len(messages), total_chars)
         return messages
+
+    def _extract_message_from_partial(self, text: str) -> str | None:
+        """Extract message field from truncated JSON (e.g. LLM cut off mid-response)."""
+        match = re.search(r'"message"\s*:\s*"((?:[^"\\]|\\.){5,})', text)
+        if match:
+            msg = match.group(1).rstrip("\\")
+            return msg.strip()
+        return None
 
     def _parse_llm_response(self, raw_text: str) -> CoreLLMResponse:
         """Parse structured JSON from LLM output into CoreLLMResponse.
 
-        Falls back to a plain-text message if JSON parsing fails.
+        Falls back to extracted message, cleaned text, or generic message if JSON fails.
         """
         text = raw_text.strip()
         # Strip markdown code fences if present
         if text.startswith("```"):
-            text = text.split("```")[1]
+            parts = text.split("```")
+            text = parts[1] if len(parts) > 1 else text
             if text.startswith("json"):
                 text = text[4:]
             text = text.strip()
@@ -565,7 +716,18 @@ class ConversationEngine:
             data["tool_calls"] = tool_calls
             return CoreLLMResponse(**data)
         except Exception:
-            return CoreLLMResponse(message=raw_text, intent="continue")
+            msg = self._extract_message_from_partial(text)
+            if msg:
+                return CoreLLMResponse(message=msg[:300], intent="continue")
+            clean = re.sub(r'[{}\[\]"\\]', '', text)
+            clean = re.sub(r'\b(message|slot_updates|tool_calls|intent)\b\s*:', '', clean)
+            clean = clean.strip()[:300]
+            if len(clean) > 10:
+                return CoreLLMResponse(message=clean, intent="continue")
+            return CoreLLMResponse(
+                message="Уточните, пожалуйста, ваш вопрос.",
+                intent="continue",
+            )
 
     async def _apply_slot_updates(self, session: Any, slot_updates: dict) -> None:
         filtered = {}
@@ -594,12 +756,17 @@ class ConversationEngine:
         If resolver is not ready (teacher sync failed), skip resolution so LLM flow continues
         without normalization instead of returning "не нашла" for every name.
         """
-        print(f"RESOLVE_ENTRY: resolver={self._resolver is not None} ready={getattr(self._resolver, 'is_ready', 'N/A')} updates={slot_updates}")
+        logger.debug(
+            "RESOLVE_ENTRY: resolver=%s ready=%s updates=%s",
+            self._resolver is not None,
+            getattr(self._resolver, "is_ready", "N/A"),
+            slot_updates,
+        )
         if not self._resolver:
-            print("RESOLVE_EXIT: no resolver")
+            logger.debug("RESOLVE_EXIT: no resolver")
             return None
         if not getattr(self._resolver, "is_ready", True):
-            print("RESOLVE_EXIT: not ready")
+            logger.debug("RESOLVE_EXIT: not ready")
             return None
         teacher_raw = slot_updates.get("teacher_raw") if isinstance(slot_updates.get("teacher_raw"), str) else None
         style_raw = slot_updates.get("style_raw") if isinstance(slot_updates.get("style_raw"), str) else None
@@ -631,8 +798,14 @@ class ConversationEngine:
             )
             branch_raw = None
 
-        print(f"RESOLVE_AFTER_GUARDS: teacher_raw={teacher_raw} style_raw={style_raw} branch_raw={branch_raw}")
-        print(f"RESOLVE_CURRENT_SLOTS: teacher_id={session.slots.teacher_id} style_id={session.slots.style_id} branch_id={session.slots.branch_id}")
+        logger.debug(
+            "RESOLVE_AFTER_GUARDS: teacher_raw=%s style_raw=%s branch_raw=%s",
+            teacher_raw, style_raw, branch_raw,
+        )
+        logger.debug(
+            "RESOLVE_CURRENT_SLOTS: teacher_id=%s style_id=%s branch_id=%s",
+            session.slots.teacher_id, session.slots.style_id, session.slots.branch_id,
+        )
 
         # Resolve style first; save immediately so it persists even if teacher needs clarification (Fix D)
         resolved_style_id: int | str | None = None
@@ -649,7 +822,10 @@ class ConversationEngine:
 
         if teacher_raw and teacher_raw.strip():
             teachers = await self._resolver.resolve_teacher(teacher_raw.strip(), self._tenant_id)
-            print(f"RESOLVE_TEACHER: raw={teacher_raw} found={len(teachers)} names={[t.name for t in teachers]}")
+            logger.debug(
+                "RESOLVE_TEACHER: raw=%s found=%s names=%s",
+                teacher_raw, len(teachers), [t.name for t in teachers],
+            )
             # Filter by style when user said e.g. "к Насте на heels" (Fix C)
             if len(teachers) > 1 and resolved_style_id is not None:
                 try:
@@ -734,7 +910,7 @@ class ConversationEngine:
                     return template.format(nearest_branches=nearest_str)
                 return f"Не нашла филиал «{branch_raw.strip()}». Подсказать, какие есть?"
 
-        print("RESOLVE_EXIT: no clarification needed")
+        logger.debug("RESOLVE_EXIT: no clarification needed")
         return None
 
     async def _handle_subscription_inquiry(
@@ -805,7 +981,7 @@ class ConversationEngine:
 
     @staticmethod
     def _enforce_length(text: str, channel: str) -> str:
-        max_length = {"telegram": 300, "whatsapp": 200}.get(str(channel), 300)
+        max_length = {"telegram": 400, "whatsapp": 200}.get(str(channel), 400)
         if len(text) <= max_length:
             return text
         truncated = text[: max_length - 3]
@@ -832,6 +1008,7 @@ def _empty_slots() -> dict:
         "teacher_raw": None,
         "style_raw": None,
         "branch_raw": None,
+        "recent_tools": [],
     }
 
 

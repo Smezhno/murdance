@@ -4,6 +4,7 @@ Replaces full KB dump with relevant excerpts.
 Target: < 800 tokens per retrieval. Hard cap: 3200 chars.
 """
 
+import re
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
@@ -16,6 +17,16 @@ if TYPE_CHECKING:
 
 _MINIMAL_FALLBACK = "Студия She Dance, Владивосток. Уточните у администратора."
 MAX_CONTEXT_CHARS = 3200
+
+# Триггерные леммы: пользователь спрашивает «есть ли у вас X?» (без «есть» — в STOP_WORDS)
+_SERVICE_EXISTS_TRIGGERS = frozenset(
+    {"бывать", "проводить", "вести", "преподавать", "направление"}
+)
+# Для raw «есть»: срабатывать только при контексте направлений (отсечь «Есть кто живой?»)
+_DIRECTION_QUERY_SUBSTRINGS = frozenset({
+    "направлен", "групп", "занят", "стил", "танц", "бачат", "сальс", "каблук",
+    "джаз", "контемп", "хип", "хоп", "фанк", "современн", "латин", "стретч",
+})
 
 _STOP_WORDS = frozenset({
     "я", "ты", "мы", "вы", "он", "она", "оно", "они",
@@ -49,7 +60,10 @@ class KBRetriever:
         }
         self._policy_triggers = {
             self._lemma(w)
-            for w in ["отмена", "перенос", "опоздание", "возврат", "надеть", "взять", "принести"]
+            for w in [
+                "отмена", "перенос", "опоздание", "возврат",
+                "надеть", "взять", "принести", "каблук", "обувь",
+            ]
         }
 
     def _lemma(self, word: str) -> str:
@@ -68,6 +82,21 @@ class KBRetriever:
                 lemmas.add(parsed[0].normal_form)
         return lemmas
 
+    def _should_add_services_list(
+        self, lemmas: set[str], slots: "SlotValues", user_text: str = ""
+    ) -> bool:
+        """True if user asks about service existence (e.g. «есть ли у вас бачата?», «какие есть направления?»)."""
+        raw = (user_text or "").lower()
+        if "есть" in raw:
+            # «Какая есть группа по каблукам?» при уже выбранном направлении — уточнение, не список
+            if slots.group and re.search(r"как(ая|ой|ие)\s+(есть\s+)?групп", raw):
+                return False
+            # Отсечь «Есть кто живой?» — нужен контекст направлений/занятий
+            if not any(s in raw for s in _DIRECTION_QUERY_SUBSTRINGS):
+                return False
+            return True
+        return bool(lemmas & _SERVICE_EXISTS_TRIGGERS)
+
     def retrieve(
         self,
         user_text: str,
@@ -83,14 +112,15 @@ class KBRetriever:
         self._add_slot_context(sections, slots)
 
         # P2: Phase context (styles/branches if not selected)
-        self._add_phase_context(sections, phase, slots)
+        context_flags: dict[str, bool] = {}
+        self._add_phase_context(sections, phase, slots, context_flags)
 
         # P3: FAQ (lemmatized search)
         self._add_faq_context(sections, user_text, phase)
 
-        # P4: Intent triggers (subscriptions, policies)
+        # P4: Intent triggers (subscriptions, policies, ask_service_exists)
         user_lemmas = self._lemmatize(user_text)
-        self._add_intent_context(sections, user_lemmas)
+        self._add_intent_context(sections, user_lemmas, slots, user_text, context_flags)
 
         # P5: Holiday (GREETING only)
         self._add_holiday_context(sections, phase)
@@ -163,22 +193,27 @@ class KBRetriever:
         return names[:10]  # cap for prompt size
 
     def _add_phase_context(
-        self, sections: list, phase: "ConversationPhase", slots: "SlotValues"
+        self,
+        sections: list,
+        phase: "ConversationPhase",
+        slots: "SlotValues",
+        context_flags: dict[str, bool] | None = None,
     ) -> None:
         from app.core.slot_tracker import ConversationPhase
 
+        flags = context_flags if context_flags is not None else {}
         if phase in (ConversationPhase.GREETING, ConversationPhase.DISCOVERY):
             if not slots.group:
                 styles = [
                     f"{s.name}: {s.description[:50]}" for s in self._kb.services
                 ]
-                sections.append(
-                    (
-                        2,
-                        "Направления:\n" + "\n".join(f"- {s}" for s in styles),
-                        "services",
-                    )
+                directions_text = (
+                    "Направления:\n"
+                    + "\n".join(f"- {s}" for s in styles)
+                    + "\nЕсли спрашивают о другом — скажи что нет и предложи похожее."
                 )
+                sections.append((2, directions_text, "services"))
+                flags["services_added"] = True
             if (
                 not slots.branch
                 and hasattr(self._kb, "branches")
@@ -224,17 +259,33 @@ class KBRetriever:
                 sections.append((3, f"FAQ: {faq.q}\n→ {faq.a}", "faq"))
 
     def _add_intent_context(
-        self, sections: list, user_lemmas: set[str]
+        self,
+        sections: list,
+        user_lemmas: set[str],
+        slots: "SlotValues",
+        user_text: str = "",
+        context_flags: dict[str, bool] | None = None,
     ) -> None:
+        # ask_service_exists: list directions when user asks «есть ли у вас X?» / «какие есть направления?»
+        # Skip if _add_phase_context already added services (dedupe via context_flags).
+        flags = context_flags if context_flags is not None else {}
+        if (
+            not flags.get("services_added")
+            and self._should_add_services_list(user_lemmas, slots, user_text)
+            and self._kb.services
+        ):
+            names = ", ".join(s.name for s in self._kb.services)
+            text = f"Направления: {names}. Если спрашивают о другом — скажи что нет и предложи похожее."
+            sections.append((4, text, "services_exists"))
+            flags["services_added"] = True
+
         if user_lemmas & self._sub_triggers and self._kb.subscriptions:
-            lines = []
-            for s in self._kb.subscriptions[:5]:
-                classes_str = (
-                    "безлимит" if s.classes == -1 else f"{s.classes} зан."
-                )
-                lines.append(f"- {s.name}: {classes_str}, {s.price}₽")
+            parts = []
+            for s in self._kb.subscriptions:
+                cls = "безлимит" if s.classes == -1 else f"{s.classes} зан."
+                parts.append(f"{cls}/{s.price:.0f}₽")
             sections.append(
-                (4, "Абонементы:\n" + "\n".join(lines), "subscriptions")
+                (4, "Абонементы: " + ", ".join(parts), "subscriptions")
             )
 
         if user_lemmas & self._policy_triggers and self._kb.policies:

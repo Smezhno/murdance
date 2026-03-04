@@ -64,6 +64,7 @@ class GuardrailRunner:
         phase: ConversationPhase,
         crm_schedule: list | None = None,
         executed_tools: set[str] | None = None,
+        session_tools: set[str] | None = None,
         availability_cache: dict[str, GroupAvailability] | None = None,
     ) -> GuardrailResult:
         violations: list[str] = []
@@ -71,13 +72,15 @@ class GuardrailRunner:
         tool_names = {tc.name for tc in llm_response.tool_calls}
         if executed_tools:
             tool_names |= executed_tools
+        tool_names_incl_session = tool_names | (session_tools or set())
         tool_map = {tc.name: tc for tc in llm_response.tool_calls}
 
         # --- Hard checks (original message) ---
         # G12 is the primary schedule guard (no tool_call → block immediately).
+        # RFC-007 F14: allow if get_filtered_schedule was called in this session (session_tools).
         # G1 is secondary — only when get_filtered_schedule was called and we have
         # crm_schedule to verify times. After RFC-006 crm_schedule is None; tool data is source of truth.
-        g12 = self._g12_schedule_mention_without_tool(message, tool_names, phase=phase)
+        g12 = self._g12_schedule_mention_without_tool(message, tool_names_incl_session, slots=slots, phase=phase)
         violations += g12
         if not g12 and "get_filtered_schedule" in tool_names and crm_schedule is not None:
             violations += self._g1_schedule_hallucination(message, crm_schedule)
@@ -95,7 +98,7 @@ class GuardrailRunner:
         violations += self._g14_closed_group_booking(llm_response, slots, availability_cache)
 
         # --- Auto-fixes (applied after hard checks) ---
-        corrected = self._g7_truncate(message)
+        corrected = self._g7_truncate(message, intent=getattr(llm_response, "intent", "continue"))
         corrected = self._g8_strip_emoji(corrected)
         corrected_message = corrected if corrected != message else None
 
@@ -356,13 +359,17 @@ class GuardrailRunner:
     # -------------------------------------------------------------------------
 
     def _g12_schedule_mention_without_tool(
-        self, message: str, tool_names: set[str], phase: ConversationPhase | None = None
+        self,
+        message: str,
+        tool_names_incl_session: set[str],
+        slots: SlotValues | None = None,
+        phase: ConversationPhase | None = None,
     ) -> list[str]:
         # POST_BOOKING: bot answers from confirmed slot data (datetime_resolved),
         # not from a live schedule query — time mentions are legitimate here.
         if phase == ConversationPhase.POST_BOOKING:
             return []
-        if "get_filtered_schedule" in tool_names:
+        if "get_filtered_schedule" in tool_names_incl_session:
             return []
         has_time = bool(_TIME_RE.search(message))
         words = set(message.lower().split())
@@ -372,13 +379,15 @@ class GuardrailRunner:
         return []
 
     # -------------------------------------------------------------------------
-    # G7 — Auto-fix: truncate message > 300 chars at sentence boundary
+    # G7 — Auto-fix: truncate message at sentence boundary (RFC-007 F16: 500 for price/info)
     # -------------------------------------------------------------------------
 
-    def _g7_truncate(self, message: str) -> str:
-        if len(message) <= 300:
+    def _g7_truncate(self, message: str, intent: str = "continue") -> str:
+        # RFC-007 v2: global limit 400 for TG (simplification; no special 500 for price)
+        max_len = 400
+        if len(message) <= max_len:
             return message
-        truncated = message[:300]
+        truncated = message[:max_len]
         last_boundary = max(
             truncated.rfind("."),
             truncated.rfind("!"),
