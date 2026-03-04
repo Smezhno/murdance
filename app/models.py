@@ -129,6 +129,12 @@ class SlotValues(BaseModel):
     # === RFC-005: escalation offer after closed group (on "да" → escalate) ===
     escalation_pending_reason: str | None = None
 
+    # === RFC-007 F9: gibberish detection (3 in a row → escalate) ===
+    gibberish_count: int = 0
+
+    # === RFC-007 F14: tools called in this session (for G12: allow schedule mention if called earlier) ===
+    recent_tools: list[str] = Field(default_factory=list, description="Tool names called in this session")
+
 
 class Session(BaseModel):
     """Conversation session model (CONTRACT §4, §7).

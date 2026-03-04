@@ -1,5 +1,6 @@
 """StyleResolver: style_aliases from KB → CRM style IDs. Exact first, pymorphy3 fallback (RFC-004 §4.5)."""
 
+import re
 from typing import Any, Protocol
 
 from app.core.entity_resolver.inflect_helpers import get_morph, inflect_forms
@@ -78,14 +79,46 @@ class StyleResolver:
             return None
 
     def resolve(self, raw: str, tenant_id: str) -> list[ResolvedEntity]:
-        """Exact match first, then pymorphy3 normal_form. Return [] if not found."""
+        """Exact match first, then lemma, then normalized, then prefix match. Split by «и»/comma (RFC-007 F10)."""
         _ = tenant_id
         normalized = raw.strip().lower()
         if not normalized:
             return []
+
+        parts = re.split(r"\s+и\s+|,\s*", raw)
+        if len(parts) > 1:
+            seen: set[tuple[str, Any]] = set()
+            all_results: list[ResolvedEntity] = []
+            for part in parts:
+                sub = part.strip()
+                if not sub:
+                    continue
+                for e in self.resolve(sub, tenant_id):
+                    key = (e.name, e.crm_id)
+                    if key not in seen:
+                        seen.add(key)
+                        all_results.append(e)
+            if all_results:
+                return all_results
+
         if normalized in self._lookup:
             return list(self._lookup[normalized])
         lemma = self._lemmatize(normalized)
         if lemma and lemma in self._lookup:
             return list(self._lookup[lemma])
+
+        normalized = raw.replace("-", " ").replace("  ", " ").strip().lower()
+        if normalized in self._lookup:
+            return list(self._lookup[normalized])
+
+        if len(normalized) >= 3:
+            matches: list[ResolvedEntity] = []
+            for alias, entities in self._lookup.items():
+                alias_norm = alias.replace("-", " ")
+                if normalized in alias_norm or alias_norm.startswith(normalized):
+                    for e in entities:
+                        if not any(m.name == e.name and m.crm_id == e.crm_id for m in matches):
+                            matches.append(e)
+            if matches:
+                return matches
         return []

@@ -78,6 +78,7 @@ class CancelFlow:
 
             # Store in session slots (persists until session TTL expires)
             await update_slots(session, cancel_bookings=future_bookings)
+            await transition_state(session, ConversationState.CANCEL_FLOW)
 
             # Single booking — skip selection, go straight to confirmation
             if len(future_bookings) == 1:
